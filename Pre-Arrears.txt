@@ -1,0 +1,1741 @@
+
+/*Libraries and Macro Variables*/ 
+libname	p_dw	odbc  noprompt="server=SBSPSQLVS101\MISPSQL01;
+                  			driver=sql server;
+                  			database=P_DW;
+                  			trusted connection=yes;"
+                  			schema=dbo
+                  			ACCESS=READONLY;
+
+libname ddr		'H:\Portfolio Management\Credit Management\Collections Strategies 2019\DD Rejections\Deployment\Outputs SAS'; 
+libname out		'H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs SAS';
+
+%let rundate='01Jul2026'd; /*Change for 1st day of previous month (e.g. when running the strategy in August then indicate 01Jul2021)*/
+%let ss=%sysfunc(intnx(month,&rundate,0),yymmn6.);
+
+%let	lagm=4; /*Lag - Number of months*/
+%let	lagp=%sysfunc(intnx(month,&rundate,&lagm*-1),yymmn6.); /*Lag - Most recent period that can be considered when repeating contacts*/ 
+%put	&lagp;
+
+%let RG1BS=581; /*Resi G1 Behavioral Score Cut-Off*/
+%let RG2BS=601; /*Resi G2 Behavioral Score Cut-Off*/
+%let BG1BS=617; /*BTL G1 Behavioral Score Cut-Off*/
+%let BG2BS=637; /*BTL G2 Behavioral Score Cut-Off*/
+
+%let GBRS=10; /*General Bureau Risk Score Cut-Off*/
+%let SBRS=5; /*Specific Bureau Risk Score Cut-Off for BTL when combined with Geo-Delphi*/
+%let BGD=6; /*BTL Geo-Delphi Cut-Off*/
+
+/*Max contacts until 202109 (202108 month end)*/
+/*
+%let RG1Max=35;
+%let RG2Max=20;
+%let RG3Max=15;
+%let BG1Max=15;
+%let BG2Max=5;
+%let BG3Max=10;
+*/
+
+/*Max contacts from 202110 (202109 month end)*/
+%let RG1Max=51;
+%let RG2Max=26;
+%let RG3Max=23;
+%let BG1Max=22;
+%let BG2Max=26;
+%let BG3Max=23;
+
+
+
+/*Step 1: Pre Arrears Qualifyers*/
+%macro ss;
+%let yyyymm=%sysfunc(intnx(month,&rundate,0),yymmn6.);
+%let RSFrom=%sysfunc(intnx(month,&rundate,0,b),yymmddn8.);
+%let RSTo=%sysfunc(intnx(month,&rundate,0,e),yymmddn8.);
+
+proc sql;
+
+CONNECT TO odbc	("server=SBSPSQLVS101\MISPSQL01;
+				driver=sql server; 
+                database=p_dw; 
+                trusted connection=yes;");
+CREATE TABLE SS&yyyymm AS 
+SELECT * FROM CONNECTION TO ODBC
+(
+WITH CTE_DRS AS
+(
+SELECT	m99.primacno_o AS 'PrimaryAccount'
+		, m98.accnbr_o AS 'AccountNumber'
+		, da.AccountOrigin
+		, CONVERT(DATE,drs._timestamp) AS 'DRS_DateRecorded'
+		, CONVERT(DATE,drs.startDate) AS 'DRS_StartDate'
+		, CONVERT(DATE,drs.endDate) AS 'DRS_EndDate'
+		, drs.arrearsAmount AS 'DRS_Arrears'
+		
+FROM	P_ODS.SKIPCORE.DatDebtRespiteSchemeDetails drs
+
+INNER JOIN	P_ODS.SKIPCORE.MOR98 m98
+ON	drs.myAccount = m98.oid
+AND	m98.pool_id_o='SBS00001'
+INNER JOIN	P_ODS.SKIPCORE.MOR99 m99
+ON	m98.myMOR99 = m99.oid
+AND	m98.pool_id_o = m99.pool_id_o
+AND	m98.primacno_o = m99.primacno_o
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	m98.oid = da.BK_Account
+AND	m98.pool_id_o = da.AccountPool
+AND	m98.accnbr_o = da.AccountNumber
+AND	da.AccountType=10
+
+WHERE	CONVERT(DATE,drs.endDate)>=CONVERT(DATE,GETDATE())
+AND		drs.ceased=0
+),
+
+CTE_LPA AS
+(
+SELECT	rcv.primacno_o AS 'PrimaryAccount'
+
+FROM	P_ODS.SKIPCORE.RCV98 rcv
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	rcv.pool_id_o = da.AccountPool
+AND	rcv.primacno_o = da.AccountNumber
+
+WHERE	rcv.pool_id_o='SBS00001'
+AND		(da.CurrentAccountStatus IN ('Live','Possession') OR da.AccountEndDate>=DATEADD(MONTH,DATEDIFF(MONTH,0,GETDATE()),0)/*First day current month*/)
+AND		da.CurrentAccountClassification IN ('Residential','BTL Commercial','Pure Commercial')
+AND		rcv.dc_recvr_o_dt IS NOT NULL
+AND		rcv._deleted=0
+)
+
+SELECT	CASE	WHEN lu.Allocated_AccountNumber IS NOT NULL THEN lu.Allocated_AccountNumber ELSE da.AccountNumber END AS 'AccountNumber' 
+		, CASE	WHEN dc.CompanyName='Amber Homeloans Ltd' OR da.AccountOrigin='Amber Homeloans Ltd' THEN 'AHL'
+				WHEN dc.CompanyName='North Yorkshire Mortgages' OR da.AccountOrigin='North Yorkshire Mortgages Ltd' THEN 'NYM'
+				ELSE 'SBS' END AS 'Lender'
+		, dm.CalendarYear*100+dm.CalendarMonthNumber AS 'Snapshot'
+		, CASE WHEN dsp.SubPopulationCode='BTL' THEN 'BTL' ELSE 'Resi' END AS 'Segment'
+		, fma.CapitalBalanceLive AS 'BalSS'
+		, CASE	WHEN dc.CompanyName IN ('Amber Homeloans Ltd','North Yorkshire Mortgages') AND fma.StandardArrearsInMonths>0 THEN fma.StandardArrearsInMonths
+				WHEN dc.CompanyName IN ('Skipton Building Society') AND fma.ContractualArrearsInMonths>0 THEN fma.ContractualArrearsInMonths
+				ELSE 0 END AS 'MIASS'
+		, CASE	WHEN dc.CompanyName IN ('Amber Homeloans Ltd','North Yorkshire Mortgages') AND fma.StandardArrearsAmount>0 THEN fma.StandardArrearsAmount
+				WHEN dc.CompanyName IN ('Skipton Building Society') AND fma.ContractualArrearsAmount>0 THEN fma.ContractualArrearsAmount
+				ELSE 0 END AS 'ArrBalSS'
+		, CASE	WHEN da.AccountStartDate IS NOT NULL AND dc.CompanyName IN ('Amber Homeloans Ltd','North Yorkshire Mortgages') AND fma.StandardArrearsInMonths>0 
+				AND fma.StandardArrearsInMonths<1 THEN 1
+				WHEN da.AccountStartDate IS NOT NULL AND dc.CompanyName IN ('Skipton Building Society') AND fma.ContractualArrearsInMonths>0 AND fma.ContractualArrearsInMonths<1 THEN 1
+				ELSE 0 END AS 'ArrBelow1MIA'
+		, CASE WHEN bs.S3Score IS NULL THEN 999 ELSE FLOOR(bs.S3Score) END AS 'BH_Score'
+		, CASE WHEN rs.LatestRS IS NULL THEN 0 ELSE 1 END AS 'RS_Ind'
+
+FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	fma.FK_Account = da.PK_Account
+INNER JOIN	P_DW.dbo.dimCompany dc
+ON	fma.FK_Company = dc.PK_Company
+LEFT JOIN	P_ODS.reference.AHLNYMMigratedAccounts lu
+ON	da.AccountPool = lu.AHLNYM_PoolID
+AND	da.AccountNumber = lu.AHLNYM_AccountNumber
+INNER JOIN	P_DW.dbo.dimProduct dp
+ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+INNER JOIN	P_DW.dbo.dimMonth dm
+ON	FK_SnapshotDate = dm.PK_Month
+INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+INNER JOIN	P_DW.dbo.dimAccountStates das
+ON	FK_AccountStates = das.PK_AccountStates
+INNER JOIN	P_DW.dbo.dimArrangement dar
+ON	fma.FK_ArrangementType = dar.PK_ArrangementType
+LEFT JOIN	P_Modelling.COREMODEL.vwBehaviouralScorecard bs
+ON	dm.CalendarMonthYear=CONVERT(VARCHAR,bs.Period)
+AND	(CASE WHEN dc.CompanyName='Amber Homeloans Ltd' THEN 'AHL' WHEN dc.CompanyName='North Yorkshire Mortgages' THEN 'NYM' ELSE 'SBS' END) = bs.CompanyCode
+AND	da.AccountNumber = bs.PrimaryAccount
+LEFT JOIN	(SELECT *	
+			FROM	(SELECT	a98.pool_id_o, a98.accnbr_o ,a98.lettcode_o, a98.dc_creat_o_dt
+							,RANK() OVER(PARTITION BY a98.accnbr_o ORDER BY a98.dc_creat_o_dt DESC, a98.time_o DESC, a98.oid DESC) AS 'LatestRS'
+					FROM	P_ODS.SKIPCORE.ADM98 a98
+					WHERE	a98.pool_id_o='SBS00001' AND a98.lettcode_o IN ('RED001','RED01E','RED01F') AND a98.dc_creat_o BETWEEN &RSFrom AND &RSTo
+					)a
+					WHERE	a.LatestRS=1
+			)rs
+ON	da.AccountPool = rs.pool_id_o
+AND	da.AccountNumber = rs.accnbr_o
+
+WHERE	dc.CompanyName IN ('Skipton Building Society','Amber Homeloans Ltd','North Yorkshire Mortgages')
+AND		da.AccountPool<>'DRC00001'
+AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&yyyymm)
+AND		da.AccountSubType='Primary'
+AND		da.CurrentAccountClassification='Residential'
+AND		das.AccountStatus IN ('Live')
+AND		((dc.CompanyName IN ('Skipton Building Society') AND fma.ContractualArrearsInMonths<1) 
+		OR (dc.CompanyName IN ('Amber Homeloans Ltd','North Yorkshire Mortgages') AND fma.StandardArrearsInMonths<1))
+AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125') /*SBS deed accounts + Holmesdale deed and fair value accounts*/
+AND		fma.CapitalBalanceLive>1000
+AND		dar.ArrangementTypeCode<0 /*Removes accounts with an arrangement in place*/
+AND		DATEDIFF(MONTH,da.AccountStartDate,DATEADD(MONTH,0,dm.ReportingMonth))>3 /*Removes up to three months of recent completions*/
+AND		fma.RemainingTerm>12 /*Removes passed term accounts and those that will mature within the next 12 months*/
+AND		da.AccountNumber NOT IN (/*Removes accounts where one of the account holders is deceased*/
+								SELECT	b.AccountNumber
+								FROM	(SELECT	a.AccountNumber
+												, SUM(a.DeathFlag) AS 'DeathFlag'
+										FROM	(SELECT	da.AccountNumber 
+														, dc.CustomerNumber
+														, CASE WHEN dc.CustomerDateofDeath IS NOT NULL THEN 1 ELSE 0 END AS 'DeathFlag'
+																		
+												FROM	P_DW.dbo.factMortgageAccount fma
+
+												INNER JOIN	P_DW.dbo.dimAccount da
+												ON	fma.FK_Account = da.PK_Account
+												INNER JOIN	P_DW.dbo.bridgeAccountCustomer bac
+												ON	da.PK_Account = bac.FK_Account
+												AND	bac.relationshipTypeCode='19'
+												INNER JOIN	P_DW.dbo.dimCustomer dc
+												ON	bac.FK_Customer = dc.PK_Customer
+
+												WHERE	da.AccountPool='SBS00001'
+												AND		da.AccountSubType='Primary'
+												AND		da.CurrentAccountStatus IN ('Live')
+												AND		da.CurrentAccountClassification='Residential'
+												)a
+										GROUP BY a.AccountNumber
+										)b
+								WHERE	b.DeathFlag>0
+								)
+AND		da.AccountNumber NOT IN (SELECT PrimaryAccount FROM CTE_DRS) /*Removes active cases under the Debt Respite Scheme*/
+AND		da.AccountNumber NOT IN (SELECT PrimaryAccount FROM CTE_LPA) /*Removes active cases under LPA*/
+AND		da.AccountNumber NOT IN (132876009) /*Exclusion requests by CM*/
+
+ORDER BY (CASE	WHEN lu.Allocated_AccountNumber IS NOT NULL THEN lu.Allocated_AccountNumber ELSE da.AccountNumber END)
+)
+;
+DISCONNECT FROM odbc;
+;
+quit;   
+%mend ss;
+%ss;
+
+
+
+/*Step 2: Previous Performance (12m)*/
+%macro prep;
+%do i=0 %to 12;
+%let yyyymm1=%sysfunc(intnx(month,&rundate,&i*-1),yymmn6.);
+%let yyyymm2=%sysfunc(intnx(month,&rundate,0),yymmn6.);
+
+proc sql;
+CONNECT TO odbc	("server=SBSPSQLVS101\MISPSQL01;
+				driver=sql server; 
+                database=p_dw; 
+                trusted connection=yes;");
+CREATE TABLE M&i AS 
+SELECT * FROM CONNECTION TO ODBC
+(
+SELECT	CASE	WHEN lu.Allocated_AccountNumber IS NOT NULL THEN lu.Allocated_AccountNumber ELSE da.AccountNumber END AS 'AccountNumber' 
+		, CASE	WHEN dc.CompanyName IN ('Amber Homeloans Ltd','North Yorkshire Mortgages') AND fma.StandardArrearsInMonths>=1 THEN 1
+				WHEN dc.CompanyName IN ('Skipton Building Society') AND fma.ContractualArrearsInMonths>=1 THEN 1
+				ELSE 0 END AS MIA_1P&i
+		, CASE	WHEN dc.CompanyName IN ('Amber Homeloans Ltd','North Yorkshire Mortgages') AND fma.StandardArrearsAmount>0 THEN 1
+				WHEN dc.CompanyName IN ('Skipton Building Society') AND fma.ContractualArrearsAmount>0 THEN 1
+				ELSE 0 END AS Arr_Ind&i
+
+FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	fma.FK_Account = da.PK_Account
+INNER JOIN	P_DW.dbo.dimCompany dc
+ON	fma.FK_Company = dc.PK_Company
+LEFT JOIN	P_ODS.reference.AHLNYMMigratedAccounts lu
+ON	da.AccountPool = lu.AHLNYM_PoolID
+AND	da.AccountNumber = lu.AHLNYM_AccountNumber
+INNER JOIN	P_DW.dbo.dimMonth dm
+ON	FK_SnapshotDate = dm.PK_Month
+INNER JOIN	P_DW.dbo.dimAccountStates das
+ON	FK_AccountStates = das.PK_AccountStates
+
+WHERE	dc.CompanyName IN ('Skipton Building Society','Amber Homeloans Ltd','North Yorkshire Mortgages')
+AND		da.AccountPool<>'DRC00001'
+AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&yyyymm1)
+AND		da.AccountSubType='Primary'
+AND		das.AccountStatus IN ('Live')
+AND		da.AccountStartDate<=DATEADD(MONTH,DATEDIFF(MONTH,-1,dm.BatchDate)-1,-1) /*Accounts completed up to the last day of the month preceding the observed snapshot*/
+
+ORDER BY (CASE	WHEN lu.Allocated_AccountNumber IS NOT NULL THEN lu.Allocated_AccountNumber ELSE da.AccountNumber END)
+)
+;
+DISCONNECT FROM odbc;
+quit;
+%end;
+
+data Prep&yyyymm2; set M0; run;
+proc delete data=M0; run;
+
+%do i=1 %to 12;
+data	Prep&yyyymm2;
+merge	Prep&yyyymm2(in=a) M&i(in=b);
+by		AccountNumber;
+if		a;
+if		MIA_1P&i=. then MIA_1P&i=0; else MIA_1P&i=MIA_1P&i;
+if		Arr_Ind&i=. then Arr_Ind&i=0; else Arr_Ind&i=Arr_Ind&i;
+run;
+proc delete data=M&i; run;
+%end;
+
+data	Prep&yyyymm2;
+set		Prep&yyyymm2;
+MIAH='            ';
+MIAH=cat(of MIA_1P1-MIA_1P12);
+ArrH='            ';
+ArrH=cat(of Arr_Ind1-Arr_Ind12);
+if	sum(of MIA_1P1-MIA_1P12)>=1 then MIA1X_pre12m=1; else MIA1X_pre12m=0; format MIA1X_pre12m 1.;
+if	sum(of Arr_Ind1-Arr_Ind12)=1 then AB1X_pre12m=1; else AB1X_pre12m=0; format AB1X_pre12m 1.;
+if	sum(of Arr_Ind1-Arr_Ind12)>1 then AB2X_pre12m=1; else AB2X_pre12m=0; format AB2X_pre12m 1.;
+keep	AccountNumber MIAH ArrH MIA1X_pre12m AB1X_pre12m AB2X_pre12m;
+run;
+
+%mend prep;
+%prep;
+
+
+
+/*Step 3: Importing DDR strategy target accounts for current month*/
+%macro ddr;
+%let yymm=%sysfunc(intnx(month,&rundate,1),yymmn4.); /*Accounts flagged the following month of the observed snapshot*/
+%let yyyymm=%sysfunc(intnx(month,&rundate,0),yymmn6.);
+
+data	DDR&yyyymm; 
+set		ddr.ddr&yymm(keep=PrimaryAccount Target); 
+AccountNumber=PrimaryAccount; format AccountNumber 9.;
+DDR=1; format DDR 1.;
+if Target=1; 
+keep AccountNumber DDR;
+run;
+proc sort data=DDR&yyyymm nodup; by AccountNumber; run;
+;
+%mend ddr;
+%ddr;
+
+
+
+/*Step 4: Bureau Riskier Qualifyers*/
+%let brss=%sysfunc(intnx(month,&rundate,0),yymmn6.);
+proc sql;
+CONNECT TO odbc	("server=SBSPSQLVS101\MISPSQL01;
+				driver=sql server; 
+                database=p_dw; 
+                trusted connection=yes;");
+CREATE TABLE BR&brss AS 
+SELECT * FROM CONNECTION TO ODBC
+(
+WITH CTE_PC1 AS
+(
+SELECT	DISTINCT b.PC1, b.GD_Index1, b.GD_Score1
+FROM	(SELECT	a.*, RANK() OVER(PARTITION BY a.PC1 ORDER BY a.GD_Index1 DESC, a.GD_Score1 ASC) AS 'GD_IndexRank'
+		FROM	(SELECT	CASE	WHEN LEN(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''))=7 THEN SUBSTRING(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''),1,4)+' '+SUBSTRING(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''),5,3) 
+								WHEN LEN(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''))=6 THEN SUBSTRING(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''),1,3)+' '+SUBSTRING(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''),4,3) 
+								WHEN LEN(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''))=5 THEN SUBSTRING(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''),1,2)+' '+SUBSTRING(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''),3,3)  
+								WHEN LEN(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''))=4 THEN SUBSTRING(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''),1,1)+' '+SUBSTRING(REPLACE(ex.PORTFOLIO_POSTCODE,' ',''),2,3)
+								ELSE ex.PORTFOLIO_POSTCODE END AS 'PC1'
+								, ex.ND_G_01 'GD_Index1' /*Geo-Delphi Index 1-9 lower to higher risk*/
+								, ex.ND_G_02 'GD_Score1' /*Geo-Delphi Score*/
+								, RANK()OVER(PARTITION BY ex.Period, ex.LenderCode, ex.PrimaryAccount ORDER BY ex.CustomerID ASC) AS 'CustRank' 
+								
+				FROM	P_ODS.EXPERIAN.DCMGen10 ex
+				WHERE	ex.Period=&brss
+				)a
+		WHERE	a.CustRank=1
+		AND		a.PC1 IS NOT NULL
+		AND		LEFT(a.PC1,1) NOT IN ('0','1','2','3','4','5','6','7','8','9')
+		)b
+WHERE	b.GD_IndexRank=1
+),
+
+CTE_PC2 AS 
+(
+SELECT DISTINCT	b.PC2, b.GD_Index2, b.GD_Score2
+FROM	(SELECT a.*, RANK() OVER(PARTITION BY a.PC2 ORDER BY a.GD_Index2 DESC, a.GD_Score2 ASC) AS 'GD_IndexRank'
+		FROM	(SELECT	CASE	WHEN LEN(p1.PC1)=8 THEN SUBSTRING(p1.PC1,1,7)
+								WHEN LEN(p1.PC1)=7 THEN SUBSTRING(p1.PC1,1,6)
+								WHEN LEN(p1.PC1)=6 THEN SUBSTRING(p1.PC1,1,5)
+								WHEN LEN(p1.PC1)=5 THEN SUBSTRING(p1.PC1,1,4)    
+								ELSE p1.PC1 END AS 'PC2'
+						, p1.GD_Index1 AS 'GD_Index2'
+						, p1.GD_Score1 AS 'GD_Score2'
+
+				FROM	CTE_PC1 p1
+				)a
+		)b
+WHERE	b.GD_IndexRank=1
+),
+
+CTE_C1 AS
+(
+SELECT	dm.CalendarMonthYear 'Period'
+		, CASE	WHEN lu.Allocated_AccountNumber IS NOT NULL THEN lu.Allocated_AccountNumber ELSE da.AccountNumber END AS 'AccountNumber'
+		, CASE	WHEN dsp.SubPopulationCode='BTL' THEN 'BTL' ELSE 'Resi' END AS 'Lending'
+		, dms.PostCode
+		, CASE	WHEN LEN(REPLACE(dms.PostCode,' ',''))=7 THEN SUBSTRING(dms.PostCode,1,7)
+				WHEN LEN(REPLACE(dms.PostCode,' ',''))=6 THEN SUBSTRING(dms.PostCode,1,6)
+				WHEN LEN(REPLACE(dms.PostCode,' ',''))=5 THEN SUBSTRING(dms.PostCode,1,5)
+				WHEN LEN(REPLACE(dms.PostCode,' ',''))=4 THEN SUBSTRING(dms.PostCode,1,4)    
+				ELSE dms.PostCode END AS 'PC2'
+		, CASE	WHEN dsp.SubPopulationCode<>'BTL' AND ex.ND_G_01 IS NOT NULL THEN ex.ND_G_01
+				WHEN dsp.SubPopulationCode<>'BTL' AND ex.ND_G_01 IS NULL THEN 0
+				WHEN dsp.SubPopulationCode='BTL' AND p1.GD_Index1 IS NOT NULL THEN p1.GD_Index1
+				WHEN dsp.SubPopulationCode='BTL' AND p1.GD_Index1 IS NULL AND p2.GD_Index2 IS NOT NULL THEN p2.GD_Index2
+				ELSE 0 END AS 'GD_Index' /*Geo-Delphi Index 1-9 lower to higher risk*/ 
+		, CASE	WHEN dsp.SubPopulationCode<>'BTL' AND ex.ND_G_02 IS NOT NULL THEN ex.ND_G_02
+				WHEN dsp.SubPopulationCode<>'BTL' AND ex.ND_G_02 IS NULL THEN 0
+				WHEN dsp.SubPopulationCode='BTL' AND p1.GD_Score1 IS NOT NULL THEN p1.GD_Score1
+				WHEN dsp.SubPopulationCode='BTL' AND p1.GD_Score1 IS NULL AND p2.GD_Score2 IS NOT NULL THEN p2.GD_Score2
+				ELSE 0 END AS 'GD_Score' /*Geo-Delphi Score*/
+		, CASE	WHEN dsp.SubPopulationCode='BTL' AND p1.GD_Index1 IS NULL AND p2.GD_Index2 IS NOT NULL THEN 1
+				ELSE 0 END AS 'GD_BTLProxy2'
+		, ex.PORTFOLIO_TITLE+' '+ex.PORTFOLIO_GIVEN_NM+' '+ex.PORTFOLIO_FAM_NM AS 'Cust1'
+		, ex.SP_CONSUMER_INDEBT AS 'CII_C1'
+		, ex.E5_S_05_1 'AAM_C1' /*Arrears and Account Management (AAM) Score*/
+
+		/***Bureau Riskier Criterion*/
+		/*Credit Limit Utilisation
+			ex.SP_F1_30 --> Number of active revolving CAIS with CLU > 75%
+			ex.SP_F3_35 --> Total CLU of active revolving CAIS
+			ex.SP_F3_36 --> Total CLU of active revolving CAIS opened in last 12 months*/
+		, CASE	WHEN (ex.SP_F3_35>=90 AND ex.SP_F3_35<9999) AND ex.SP_F1_30>2 AND (SP_F3_36>=90 AND SP_F3_36<9999) THEN 3 
+				WHEN (ex.SP_F3_35>=90 AND ex.SP_F3_35<9999) AND ex.SP_F1_30>2 THEN 2
+				WHEN (ex.SP_F3_35>=85 AND ex.SP_F3_35<9999) AND ex.SP_F1_30>1 THEN 1
+				ELSE 0 END AS 'CLU_Score_C1'
+				
+		/*Behavioural Data Sharing
+			ex.PTBR_L3M_NPR_L3M --> Overall Payment to balance % in Last 3m on CC Accounts with No Promotional Rate in the last 3 months
+			ex.PTBR_L6M_NPR_L6M --> Overall Payment to balance % in Last 6m on CC Accounts with No Promotional Rate in the last 6 months
+			ex.CLU_NPR_L1M --> CLU % on CC Accounts with no Promotional Rate
+			ex.NO_CA_L3M --> Total # Cash Advances in the Last 3 Months
+			ex.NO_MLV_CA_L3M --> Count of the active CAIS accounts with BDS data supplied having 6 or more Cash Advances in the last three months with an average value less than £100*/
+		, CASE	WHEN (ex.CLU_NPR_L1M>=90 AND ex.CLU_NPR_L1M<9999 AND ex.PTBR_L6M_NPR_L6M>=0 AND ex.PTBR_L6M_NPR_L6M<=5) AND (ex.NO_CA_L3M>=3 OR ex.NO_MLV_CA_L3M>0) THEN 3
+				WHEN (ex.CLU_NPR_L1M>=90 AND ex.CLU_NPR_L1M<9999 AND ex.PTBR_L6M_NPR_L6M>=0 AND ex.PTBR_L6M_NPR_L6M<=5) THEN 2
+				WHEN (ex.CLU_NPR_L1M>=90 AND ex.CLU_NPR_L1M<9999 AND ex.PTBR_L3M_NPR_L3M>=0 AND ex.PTBR_L3M_NPR_L3M<=5) THEN 1
+				ELSE 0 END AS 'BDS_Score_C1'
+									
+		/*Vertical Market - Bank Cards
+		ex.VM01_SP_VM2_04 --> Worst Status L6M - On Active CC accounts
+		ex.VM01_SP_VM2_05 --> Current Worst Status - On Active CC accounts
+		ex.VM01_SP_VM2_23 --> Total CLU active CC accounts CLU GT 0 (%)
+		ex.VM01_SP_VM2_29 --> Time since most recent default CC account*/
+		, CASE	WHEN ex.VM01_SP_VM2_29>=1 AND ex.VM01_SP_VM2_29<=12 THEN 3 
+				WHEN (ex.VM01_SP_VM2_29>12 AND ex.VM01_SP_VM2_29<=24) OR ex.VM01_SP_VM2_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM01_SP_VM2_05 IN ('0','1','2','3') AND ex.VM01_SP_VM2_04 IN ('4','5','6','7') AND ex.VM01_SP_VM2_23>=75 THEN 1
+				ELSE 0 END AS 'VM_BankCards_Score_C1'
+
+		/*Vertical Market - Credit Sales Agreements
+		ex.VM02_SP_VM1_04 --> Worst Status L6M - On Active CS accounts
+		ex.VM02_SP_VM1_05 --> Current Worst Status - On Active CS accounts
+		ex.VM02_SP_VM1_21 --> Time since most recent default CS account*/
+		, CASE	WHEN ex.VM02_SP_VM1_21>=1 AND ex.VM02_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM02_SP_VM1_21>12 AND ex.VM02_SP_VM1_21<=24) OR ex.VM02_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM02_SP_VM1_05 IN ('0','1','2','3') AND ex.VM02_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_CSA_Score_C1'
+		
+		/*Vertical Market - Retail Storecards
+		ex.VM03_SP_VM2_04 --> Worst Status L6M - On Active RS accounts
+		ex.VM03_SP_VM2_05 --> Current Worst Status - On Active RS accounts
+		ex.VM03_SP_VM2_23 --> Total CLU active RS accounts CLU GT 0 (%)
+		ex.VM03_SP_VM2_29 --> Time since most recent default RS account*/
+		, CASE	WHEN ex.VM03_SP_VM2_29>=1 AND ex.VM03_SP_VM2_29<=12 THEN 3 
+				WHEN (ex.VM03_SP_VM2_29>12 AND ex.VM03_SP_VM2_29<=24) OR ex.VM03_SP_VM2_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM03_SP_VM2_05 IN ('0','1','2','3') AND ex.VM03_SP_VM2_04 IN ('4','5','6','7') AND ex.VM03_SP_VM2_23>=75 THEN 1
+				ELSE 0 END AS 'VM_RetCards_Score_C1'
+
+		/*Vertical Market - Unsecured Loans
+		ex.VM04_SP_VM1_04 --> Worst Status L6M - On Active UL accounts
+		ex.VM04_SP_VM1_05 --> Current Worst Status - On Active UL accounts
+		ex.VM04_SP_VM1_21 --> Time since most recent default UL account*/
+		, CASE	WHEN ex.VM04_SP_VM1_21>=1 AND ex.VM04_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM04_SP_VM1_21>12 AND ex.VM04_SP_VM1_21<=24) OR ex.VM04_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM04_SP_VM1_05 IN ('0','1','2','3') AND ex.VM04_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_UL_Score_C1'
+
+		/*Vertical Market - Vehicle finance / Hire purchase
+		ex.VM05_SP_VM1_04 --> Worst Status L6M - On Active HP accounts
+		ex.VM05_SP_VM1_05 --> Current Worst Status - On Active HP accounts
+		ex.VM05_SP_VM1_21 --> Time since most recent default HP account*/
+		, CASE	WHEN ex.VM05_SP_VM1_21>=1 AND ex.VM05_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM05_SP_VM1_21>12 AND ex.VM05_SP_VM1_21<=24) OR ex.VM05_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM05_SP_VM1_05 IN ('0','1','2','3') AND ex.VM05_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_VF_HP_Score_C1'
+		
+		/*Vertical Market - Secured Loans
+		ex.VM06_SP_VM1_04 --> Worst Status L6M - On Active SL accounts
+		ex.VM06_SP_VM1_05 --> Current Worst Status - On Active SL accounts
+		ex.VM06_SP_VM1_21 --> Time since most recent default SL account*/
+		, CASE	WHEN ex.VM06_SP_VM1_21>=1 AND ex.VM06_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM06_SP_VM1_21>12 AND ex.VM06_SP_VM1_21<=24) OR ex.VM06_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM06_SP_VM1_05 IN ('0','1','2','3') AND ex.VM06_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_SL_Score_C1'
+
+		/*Vertical Market - Mortgages
+		ex.VM07_SP_VM1_04 --> Worst Status L6M - On Active MG accounts
+		ex.VM07_SP_VM1_05 --> Current Worst Status - On Active MG accounts
+		ex.VM07_SP_VM1_21 --> Time since most recent default MG account*/
+		, CASE	WHEN ex.VM07_SP_VM1_21>=1 AND ex.VM07_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM07_SP_VM1_21>12 AND ex.VM07_SP_VM1_21<=24) OR ex.VM07_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM07_SP_VM1_05 IN ('0','1','2','3') AND ex.VM07_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_MG_Score_C1'
+
+		/*Vertical Market - Current Accounts
+		ex.VM08_SP_VM2_04 --> Worst Status L6M - On Active CA accounts
+		ex.VM08_SP_VM2_05 --> Current Worst Status - On Active CA accounts
+		ex.VM08_SP_VM2_23 --> Total CLU active CA accounts CLU GT 0 (%)
+		ex.VM08_SP_VM2_29 --> Time since most recent default CA account*/
+		, CASE	WHEN ex.VM08_SP_VM2_29>=1 AND ex.VM08_SP_VM2_29<=12 THEN 3 
+				WHEN (ex.VM08_SP_VM2_29>12 AND ex.VM08_SP_VM2_29<=24) OR ex.VM08_SP_VM2_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM08_SP_VM2_05 IN ('0','1','2','3') AND ex.VM08_SP_VM2_04 IN ('4','5','6','7') AND ex.VM08_SP_VM2_23>=75 THEN 1
+				ELSE 0 END AS VM_CA_Score_C1
+
+		/*Vertical Market - Utilities
+		ex.VM09_SP_VM1_04 --> Worst Status L6M - On Active UT accounts
+		ex.VM09_SP_VM1_05 --> Current Worst Status - On Active UT accounts
+		ex.VM09_SP_VM1_21 --> Time since most recent default UT account*/
+		, CASE	WHEN ex.VM09_SP_VM1_21>=1 AND ex.VM09_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM09_SP_VM1_21>12 AND ex.VM09_SP_VM1_21<=24) OR ex.VM09_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM09_SP_VM1_05 IN ('0','1','2','3') AND ex.VM09_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_UT_Score_C1'
+
+		/*Vertical Market - Home Shopping (Mail Order)
+		ex.VM10_SP_VM2_04 --> Worst Status L6M - On Active CA accounts
+		ex.VM10_SP_VM2_05 --> Current Worst Status - On Active CA accounts
+		ex.VM10_SP_VM2_23 --> Total CLU active CA accounts CLU GT 0 (%)
+		ex.VM10_SP_VM2_29 --> Time since most recent default CA account*/
+		, CASE	WHEN ex.VM10_SP_VM2_29>=1 AND ex.VM10_SP_VM2_29<=12 THEN 3 
+				WHEN (ex.VM10_SP_VM2_29>12 AND ex.VM10_SP_VM2_29<=24) OR ex.VM10_SP_VM2_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM10_SP_VM2_05 IN ('0','1','2','3') AND ex.VM10_SP_VM2_04 IN ('4','5','6','7') AND ex.VM10_SP_VM2_23>=75 THEN 1
+				ELSE 0 END AS 'VM_HS_Score_C1'
+
+		/*Home Credit & PayDay Loans
+		ex.HC_A_08 --> Total Balance on All Active HC accounts
+		ex.HC_C_05 --> Time Since Most Recent Default HC account
+		ex.HC_E_02 --> Total Number of HC Searches in L3M*/
+		, CASE	WHEN ex.HC_C_05>=1 AND ex.HC_C_05<=12 THEN 3
+				WHEN (ex.HC_C_05>12 AND ex.HC_C_05<=24) OR ex.HC_A_08>0 THEN 2
+				WHEN ex.HC_A_08=0 AND ex.HC_E_02>0 THEN 1
+				ELSE 0 END AS 'HC_Score_C1'
+		
+		/*ex.PDL_C_01 --> Number of active PDL accounts
+		ex.PDL_E_01 --> Number of default PDL in the last 12 months
+		ex.PDL_F_01 --> Number of Personal Loans searches in the last 3 months*/
+		, CASE	WHEN ex.PDL_E_01>0 THEN 3
+				WHEN ex.PDL_E_01=0 AND ex.PDL_C_01>0 THEN 2
+				WHEN ex.PDL_E_01=0 AND ex.PDL_C_01=0 AND ex.PDL_F_01>0 THEN 1
+				ELSE 0 END AS 'PDL_Score_C1'
+
+		/*Impaired Credit History
+		ex.MAIN_IVA --> V=Subject to IVA within last 3 years
+		ex.MAIN_BANKRUPT --> B=Bankruptcy order or Scottish sequestration within last 3 years (satisfied date is within last 3 years, in the future or zero)
+		ex.MAIN_CCJ --> Actual value of CCJ records for Same Person – provided that the total value is over £500 within the last 3 years. 1=CCJs<=£500, 11=CCJs £501-550
+		ex.EA1_D_03 --> Most recent outstanding Public Information Record in months*/
+		, CASE	WHEN ex.MAIN_BANKRUPT='B' OR ex.MAIN_IVA='V' THEN 3
+				WHEN (ex.MAIN_BANKRUPT<>'B' AND ex.MAIN_IVA<>'V') AND ex.MAIN_CCJ>=500 AND (ex.EA1_D_03>0 AND ex.EA1_D_03<=12) THEN 2
+				WHEN (ex.MAIN_BANKRUPT<>'B' AND ex.MAIN_IVA<>'V') AND ex.MAIN_CCJ>=500 AND ex.EA1_D_03>12 THEN 1
+				ELSE 0 END AS 'BankIVAPIR_Score_C1'
+
+		/*Never Paid Defaults & Early Bads*/
+		/*NPD is the term applied to people who have made no payments on a debt, which is the characteristic of people who had no real intention of paying, where there have been no payments made from when the account was opened to when the 
+		account defaulted. This is defined as current status of 8 and the account opened and the account settled date are less than 9 months apart.
+		ex.NPD_BAL_NPD_SP_L12M --> Balance of NPDs in the last 12 months
+		ex.NPD_BAL_NPD_SP_L18M --> Balance of NPDs ever*/
+
+		/*EBAD is the term applied to describe a person identified as having defaulted at an early stage after openning the account. This will be determined by the following criteria: If the account has a status greater than ‘3’ or two consecutive 
+		statuses = ‘3’ within the first seven months of account being opened
+		ex.NPD_BAL_EBAD_SP_L12M --> Balance of EBADs in the last 12 months
+		ex.NPD_BAL_EBAD_SP_L18M --> Balance of EBADs ever*/
+		, CASE	WHEN NPD_BAL_NPD_SP_L12M>=500 THEN 3
+				WHEN NPD_BAL_NPD_SP_L12M<500 AND ex.NPD_BAL_EBAD_SP_L12M>=500 THEN 2
+				WHEN NPD_BAL_NPD_SP_L12M=0 AND ex.NPD_BAL_EBAD_SP_L12M=0 AND (ex.NPD_BAL_NPD_SP_L18M>=500 OR ex.NPD_BAL_EBAD_SP_L18M>=500) THEN 1
+				ELSE 0 END AS 'NPD_EB_Score_C1'
+
+		/*CIFAS Fraud Category (Last Reason Code)*/
+		, CASE	WHEN ex.SP_C_24 NOT IN ('N','T','00','99') THEN 3 ELSE 0 END AS 'CIFAS_Score_C1'
+
+FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	fma.FK_Account = da.PK_Account
+INNER JOIN	P_DW.dbo.dimMonth dm
+ON	fma.FK_SnapshotDate = dm.PK_Month
+INNER JOIN	P_DW.dbo.dimAccountStates das
+ON	fma.FK_AccountStates = das.PK_AccountStates
+INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+INNER JOIN	P_DW.dbo.dimProduct dp
+ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+INNER JOIN	P_DW.dbo.dimMortgageSecurity dms
+ON	fma.FK_MortgageSecurity = dms.PK_MortgageSecurity
+INNER JOIN	P_DW.dbo.dimCompany dc
+ON	fma.FK_Company = dc.PK_Company
+LEFT JOIN	P_ODS.reference.AHLNYMMigratedAccounts lu
+ON	da.AccountPool = lu.AHLNYM_PoolID
+AND	da.AccountNumber = lu.AHLNYM_AccountNumber
+LEFT JOIN	(SELECT b.*	
+			FROM 	(SELECT	a.*
+							, RANK()OVER(PARTITION BY a.Period, a.LenderCode, a.PrimaryAccount ORDER BY a.CustomerID ASC) AS 'CustRank'  
+					FROM	P_ODS.EXPERIAN.DCMGen10 a
+					WHERE	a.Period=&brss
+					)b
+			WHERE b.CustRank=1
+			)ex
+ON	(CASE WHEN dc.CompanyName='Amber Homeloans Ltd' THEN 'AHL' WHEN dc.CompanyName='North Yorkshire Mortgages' THEN 'NYM' ELSE 'SBS' END) = ex.LenderCode
+AND	da.AccountNumber = ex.PrimaryAccount
+LEFT JOIN	CTE_PC1 p1
+ON	dms.PostCode = p1.PC1
+LEFT JOIN	CTE_PC2 p2
+ON	(CASE	WHEN LEN(REPLACE(dms.PostCode,' ',''))=7 THEN SUBSTRING(dms.PostCode,1,7)
+			WHEN LEN(REPLACE(dms.PostCode,' ',''))=6 THEN SUBSTRING(dms.PostCode,1,6)
+			WHEN LEN(REPLACE(dms.PostCode,' ',''))=5 THEN SUBSTRING(dms.PostCode,1,5)
+			WHEN LEN(REPLACE(dms.PostCode,' ',''))=4 THEN SUBSTRING(dms.PostCode,1,4)    
+			ELSE dms.PostCode 
+	END) = p2.PC2
+
+WHERE	dc.CompanyName IN ('Skipton Building Society','Amber Homeloans Ltd','North Yorkshire Mortgages')
+AND		da.AccountPool<>'DRC00001'
+AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&brss)
+AND		da.AccountSubType='Primary'
+AND		da.CurrentAccountClassification='Residential'
+AND		das.AccountStatus='Live'
+AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125')
+AND		fma.CapitalBalanceLive>1000
+AND		((dc.CompanyName IN ('Skipton Building Society') AND fma.ContractualArrearsInMonths<1) 
+		OR (dc.CompanyName IN ('Amber Homeloans Ltd','North Yorkshire Mortgages') AND fma.StandardArrearsInMonths<1))
+AND		da.AccountStartDate<=DATEADD(MONTH,DATEDIFF(MONTH,-1,dm.BatchDate)-1,-1) /*Accounts completed up to the last day of the month preceding the observed snapshot*/
+),
+
+CTE_C2 AS
+(
+SELECT	CASE	WHEN lu.Allocated_AccountNumber IS NOT NULL THEN lu.Allocated_AccountNumber ELSE da.AccountNumber END AS 'AccountNumber'
+		, ex.PORTFOLIO_TITLE+' '+ex.PORTFOLIO_GIVEN_NM+' '+ex.PORTFOLIO_FAM_NM AS 'Cust2'
+		, ex.SP_CONSUMER_INDEBT AS 'CII_C2'
+		, ex.E5_S_05_1 'AAM_C2' /*Arrears and Account Management (AAM) Score*/
+
+		/*Bureau Riskier Criterion*/
+		/*CLU*/
+		, CASE	WHEN (ex.SP_F3_35>=90 AND ex.SP_F3_35<9999) AND ex.SP_F1_30>2 AND (SP_F3_36>=90 AND SP_F3_36<9999) THEN 3
+				WHEN (ex.SP_F3_35>=90 AND ex.SP_F3_35<9999) AND ex.SP_F1_30>2 THEN 2
+				WHEN (ex.SP_F3_35>=85 AND ex.SP_F3_35<9999) AND ex.SP_F1_30>1 THEN 1
+				ELSE 0 END AS 'CLU_Score_C2'
+
+		/*BDS*/
+		, CASE	WHEN (ex.CLU_NPR_L1M>=90 AND ex.CLU_NPR_L1M<9999 AND ex.PTBR_L6M_NPR_L6M>=0 AND ex.PTBR_L6M_NPR_L6M<=5) AND (ex.NO_CA_L3M>=3 OR ex.NO_MLV_CA_L3M>0) THEN 3
+				WHEN (ex.CLU_NPR_L1M>=90 AND ex.CLU_NPR_L1M<9999 AND ex.PTBR_L6M_NPR_L6M>=0 AND ex.PTBR_L6M_NPR_L6M<=5) THEN 2
+				WHEN (ex.CLU_NPR_L1M>=90 AND ex.CLU_NPR_L1M<9999 AND ex.PTBR_L3M_NPR_L3M>=0 AND ex.PTBR_L3M_NPR_L3M<=5) THEN 1
+				ELSE 0 END AS 'BDS_Score_C2'
+									
+		/*VM*/
+		, CASE	WHEN ex.VM01_SP_VM2_29>=1 AND ex.VM01_SP_VM2_29<=12 THEN 3 
+				WHEN (ex.VM01_SP_VM2_29>12 AND ex.VM01_SP_VM2_29<=24) OR ex.VM01_SP_VM2_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM01_SP_VM2_05 IN ('0','1','2','3') AND ex.VM01_SP_VM2_04 IN ('4','5','6','7') AND ex.VM01_SP_VM2_23>=75 THEN 1
+				ELSE 0 END AS 'VM_BankCards_Score_C2'
+
+		, CASE	WHEN ex.VM02_SP_VM1_21>=1 AND ex.VM02_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM02_SP_VM1_21>12 AND ex.VM02_SP_VM1_21<=24) OR ex.VM02_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM02_SP_VM1_05 IN ('0','1','2','3') AND ex.VM02_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_CSA_Score_C2'
+
+		, CASE	WHEN ex.VM03_SP_VM2_29>=1 AND ex.VM03_SP_VM2_29<=12 THEN 3 
+				WHEN (ex.VM03_SP_VM2_29>12 AND ex.VM03_SP_VM2_29<=24) OR ex.VM03_SP_VM2_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM03_SP_VM2_05 IN ('0','1','2','3') AND ex.VM03_SP_VM2_04 IN ('4','5','6','7') AND ex.VM03_SP_VM2_23>=75 THEN 1
+				ELSE 0 END AS 'VM_RetCards_Score_C2'
+
+		, CASE	WHEN ex.VM04_SP_VM1_21>=1 AND ex.VM04_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM04_SP_VM1_21>12 AND ex.VM04_SP_VM1_21<=24) OR ex.VM04_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM04_SP_VM1_05 IN ('0','1','2','3') AND ex.VM04_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_UL_Score_C2'
+
+		, CASE	WHEN ex.VM05_SP_VM1_21>=1 AND ex.VM05_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM05_SP_VM1_21>12 AND ex.VM05_SP_VM1_21<=24) OR ex.VM05_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM05_SP_VM1_05 IN ('0','1','2','3') AND ex.VM05_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_VF_HP_Score_C2'
+
+		, CASE	WHEN ex.VM06_SP_VM1_21>=1 AND ex.VM06_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM06_SP_VM1_21>12 AND ex.VM06_SP_VM1_21<=24) OR ex.VM06_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM06_SP_VM1_05 IN ('0','1','2','3') AND ex.VM06_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_SL_Score_C2'
+
+		, CASE	WHEN ex.VM07_SP_VM1_21>=1 AND ex.VM07_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM07_SP_VM1_21>12 AND ex.VM07_SP_VM1_21<=24) OR ex.VM07_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM07_SP_VM1_05 IN ('0','1','2','3') AND ex.VM07_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_MG_Score_C2'
+
+		, CASE	WHEN ex.VM08_SP_VM2_29>=1 AND ex.VM08_SP_VM2_29<=12 THEN 3 
+				WHEN (ex.VM08_SP_VM2_29>12 AND ex.VM08_SP_VM2_29<=24) OR ex.VM08_SP_VM2_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM08_SP_VM2_05 IN ('0','1','2','3') AND ex.VM08_SP_VM2_04 IN ('4','5','6','7') AND ex.VM08_SP_VM2_23>=75 THEN 1
+				ELSE 0 END AS 'VM_CA_Score_C2'
+
+		, CASE	WHEN ex.VM09_SP_VM1_21>=1 AND ex.VM09_SP_VM1_21<=12 THEN 3 
+				WHEN (ex.VM09_SP_VM1_21>12 AND ex.VM09_SP_VM1_21<=24) OR ex.VM09_SP_VM1_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM09_SP_VM1_05 IN ('0','1','2','3') AND ex.VM09_SP_VM1_04 IN ('4','5','6','7') THEN 1
+				ELSE 0 END AS 'VM_UT_Score_C2'
+
+		, CASE	WHEN ex.VM10_SP_VM2_29>=1 AND ex.VM10_SP_VM2_29<=12 THEN 3 
+				WHEN (ex.VM10_SP_VM2_29>12 AND ex.VM10_SP_VM2_29<=24) OR ex.VM10_SP_VM2_05 IN ('4','5','6','7') THEN 2
+				WHEN ex.VM10_SP_VM2_05 IN ('0','1','2','3') AND ex.VM10_SP_VM2_04 IN ('4','5','6','7') AND ex.VM10_SP_VM2_23>=75 THEN 1
+				ELSE 0 END AS 'VM_HS_Score_C2'
+
+		/*HC & PDL*/
+		, CASE	WHEN ex.HC_C_05>=1 AND ex.HC_C_05<=12 THEN 3
+				WHEN (ex.HC_C_05>12 AND ex.HC_C_05<=24) OR ex.HC_A_08>0 THEN 2
+				WHEN ex.HC_A_08=0 AND ex.HC_E_02>0 THEN 1
+				ELSE 0 END AS 'HC_Score_C2'
+
+		, CASE	WHEN ex.PDL_E_01>0 THEN 3
+				WHEN ex.PDL_E_01=0 AND ex.PDL_C_01>0 THEN 2
+				WHEN ex.PDL_E_01=0 AND ex.PDL_C_01=0 AND ex.PDL_F_01>0 THEN 1
+				ELSE 0 END AS 'PDL_Score_C2'
+
+		/*ICH*/
+		, CASE	WHEN ex.MAIN_BANKRUPT='B' OR ex.MAIN_IVA='V' THEN 3
+				WHEN (ex.MAIN_BANKRUPT<>'B' AND ex.MAIN_IVA<>'V') AND ex.MAIN_CCJ>=500 AND (ex.EA1_D_03>0 AND ex.EA1_D_03<=12) THEN 2
+				WHEN (ex.MAIN_BANKRUPT<>'B' AND ex.MAIN_IVA<>'V') AND ex.MAIN_CCJ>=500 AND ex.EA1_D_03>12 THEN 1
+				ELSE 0 END AS 'BankIVAPIR_Score_C2'
+
+		/*NPD & EBAD*/
+		, CASE	WHEN NPD_BAL_NPD_SP_L12M>=500 THEN 3
+				WHEN NPD_BAL_NPD_SP_L12M<500 AND ex.NPD_BAL_EBAD_SP_L12M>=500 THEN 2
+				WHEN NPD_BAL_NPD_SP_L12M=0 AND ex.NPD_BAL_EBAD_SP_L12M=0 AND (ex.NPD_BAL_NPD_SP_L18M>=500 OR ex.NPD_BAL_EBAD_SP_L18M>=500) THEN 1
+				ELSE 0 END AS 'NPD_EB_Score_C2'
+
+		/*CIFAS*/
+		, CASE	WHEN ex.SP_C_24 NOT IN ('N','T','00','99') THEN 3 ELSE 0 END AS 'CIFAS_Score_C2'
+
+FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	fma.FK_Account = da.PK_Account
+INNER JOIN	P_DW.dbo.dimMonth dm
+ON	fma.FK_SnapshotDate = dm.PK_Month
+INNER JOIN	P_DW.dbo.dimAccountStates das
+ON	fma.FK_AccountStates = das.PK_AccountStates
+INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+INNER JOIN	P_DW.dbo.dimProduct dp
+ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+INNER JOIN	P_DW.dbo.dimMortgageSecurity dms
+ON	fma.FK_MortgageSecurity = dms.PK_MortgageSecurity
+INNER JOIN	P_DW.dbo.dimCompany dc
+ON	fma.FK_Company = dc.PK_Company
+LEFT JOIN	P_ODS.reference.AHLNYMMigratedAccounts lu
+ON	da.AccountPool = lu.AHLNYM_PoolID
+AND	da.AccountNumber = lu.AHLNYM_AccountNumber
+LEFT JOIN	(SELECT b.*	
+			FROM 	(SELECT	a.*
+							, RANK()OVER(PARTITION BY a.Period, a.LenderCode, a.PrimaryAccount ORDER BY a.CustomerID ASC) AS 'CustRank'  
+					FROM	P_ODS.EXPERIAN.DCMGen10 a
+					WHERE	a.Period=&brss
+					)b
+			WHERE b.CustRank=2
+			)ex
+ON	(CASE WHEN	dc.CompanyName='Amber Homeloans Ltd' THEN 'AHL' WHEN dc.CompanyName='North Yorkshire Mortgages' THEN 'NYM' ELSE 'SBS' END) = ex.LenderCode
+AND	da.AccountNumber = ex.PrimaryAccount
+
+WHERE	dc.CompanyName IN ('Skipton Building Society','Amber Homeloans Ltd','North Yorkshire Mortgages')
+AND		da.AccountPool<>'DRC00001'
+AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&brss)
+AND		da.AccountSubType='Primary'
+AND		da.CurrentAccountClassification='Residential'
+AND		das.AccountStatus='Live'
+AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125')
+AND		fma.CapitalBalanceLive>1000
+AND		((dc.CompanyName IN ('Skipton Building Society') AND fma.ContractualArrearsInMonths<1) 
+		OR (dc.CompanyName IN ('Amber Homeloans Ltd','North Yorkshire Mortgages') AND fma.StandardArrearsInMonths<1))
+AND		da.AccountStartDate<=DATEADD(MONTH,DATEDIFF(MONTH,-1,dm.BatchDate)-1,-1) /*Accounts completed up to the last day of the month preceding the observed snapshot*/
+),
+
+CTE_Merge AS
+(
+SELECT	c1.Period, c1.AccountNumber, c1.Lending, c1.PostCode
+		/*Cust1*/
+		, CASE	WHEN c1.GD_Index IS NULL THEN 0								ELSE c1.GD_Index				END AS 'GD_Index'
+		, CASE	WHEN c1.GD_Score IS NULL THEN 0								ELSE c1.GD_Score				END AS 'GD_Score'
+		, CASE	WHEN c1.GD_BTLProxy2 IS NULL THEN 0							ELSE c1.GD_BTLProxy2			END AS 'GD_BTLProxy2'
+		, CASE	WHEN c1.Cust1 IS NULL THEN ''								ELSE c1.Cust1					END AS 'Cust1'
+		, CASE	WHEN c1.Cust1 IS NULL THEN 0								ELSE 1							END AS 'ExpData'
+		, CASE	WHEN c1.Cust1 IS NOT NULL AND c2.Cust2 IS NOT NULL THEN 1	ELSE 0							END AS 'Cust2Data'
+ 		, CASE	WHEN c1.CII_C1 IS NULL THEN 0								ELSE c1.CII_C1					END AS 'CII_C1'
+		, CASE	WHEN c1.AAM_C1 IS NULL THEN 0								ELSE c1.AAM_C1					END AS 'AAM_C1'
+		, CASE	WHEN c1.CLU_Score_C1 IS NULL THEN 0							ELSE c1.CLU_Score_C1			END AS 'CLU_Score_C1'
+		, CASE	WHEN c1.BDS_Score_C1 IS NULL THEN 0							ELSE c1.BDS_Score_C1			END AS 'BDS_Score_C1'
+		, CASE	WHEN c1.VM_BankCards_Score_C1 IS NULL THEN 0 				ELSE c1.VM_BankCards_Score_C1	END AS 'VM_BankCards_Score_C1'
+		, CASE	WHEN c1.VM_CSA_Score_C1 IS NULL THEN 0						ELSE c1.VM_CSA_Score_C1			END AS 'VM_CSA_Score_C1'
+		, CASE	WHEN c1.VM_RetCards_Score_C1 IS NULL THEN 0					ELSE c1.VM_RetCards_Score_C1	END AS 'VM_RetCards_Score_C1'
+		, CASE	WHEN c1.VM_UL_Score_C1 IS NULL THEN 0						ELSE c1.VM_UL_Score_C1			END AS 'VM_UL_Score_C1'
+		, CASE	WHEN c1.VM_VF_HP_Score_C1 IS NULL THEN 0					ELSE c1.VM_VF_HP_Score_C1		END AS 'VM_VF_HP_Score_C1'
+		, CASE	WHEN c1.VM_SL_Score_C1 IS NULL THEN 0						ELSE c1.VM_SL_Score_C1			END AS 'VM_SL_Score_C1'
+		, CASE	WHEN c1.VM_MG_Score_C1 IS NULL THEN 0						ELSE c1.VM_MG_Score_C1			END AS 'VM_MG_Score_C1'
+		, CASE	WHEN c1.VM_CA_Score_C1 IS NULL THEN 0						ELSE c1.VM_CA_Score_C1			END AS 'VM_CA_Score_C1'
+		, CASE	WHEN c1.VM_UT_Score_C1 IS NULL THEN 0						ELSE c1.VM_UT_Score_C1			END AS 'VM_UT_Score_C1'
+		, CASE	WHEN c1.VM_HS_Score_C1 IS NULL THEN 0						ELSE c1.VM_HS_Score_C1			END AS 'VM_HS_Score_C1'
+		, CASE	WHEN c1.HC_Score_C1 IS NULL THEN 0							ELSE c1.HC_Score_C1				END AS 'HC_Score_C1'
+		, CASE	WHEN c1.PDL_Score_C1 IS NULL THEN 0							ELSE c1.PDL_Score_C1			END AS 'PDL_Score_C1'
+		, CASE	WHEN c1.BankIVAPIR_Score_C1 IS NULL THEN 0					ELSE c1.BankIVAPIR_Score_C1		END AS 'BankIVAPIR_Score_C1'
+ 		, CASE	WHEN c1.NPD_EB_Score_C1 IS NULL THEN 0						ELSE c1.NPD_EB_Score_C1			END AS 'NPD_EB_Score_C1'
+		, CASE	WHEN c1.CIFAS_Score_C1 IS NULL THEN 0						ELSE c1.CIFAS_Score_C1			END AS 'CIFAS_Score_C1'
+
+		/*Cust2*/
+		, CASE	WHEN c2.Cust2 IS NULL THEN ''					ELSE c2.Cust2					END AS 'Cust2'
+ 		, CASE	WHEN c2.CII_C2 IS NULL THEN 0					ELSE c2.CII_C2					END AS 'CII_C2'
+		, CASE	WHEN c2.AAM_C2 IS NULL THEN 0					ELSE c2.AAM_C2					END AS 'AAM_C2'
+		, CASE	WHEN c2.CLU_Score_C2 IS NULL THEN 0				ELSE c2.CLU_Score_C2			END AS 'CLU_Score_C2'
+		, CASE	WHEN c2.BDS_Score_C2 IS NULL THEN 0				ELSE c2.BDS_Score_C2			END AS 'BDS_Score_C2'
+		, CASE	WHEN c2.VM_BankCards_Score_C2 IS NULL THEN 0	ELSE c2.VM_BankCards_Score_C2	END AS 'VM_BankCards_Score_C2'
+		, CASE	WHEN c2.VM_CSA_Score_C2 IS NULL THEN 0			ELSE c2.VM_CSA_Score_C2			END AS 'VM_CSA_Score_C2'
+		, CASE	WHEN c2.VM_RetCards_Score_C2 IS NULL THEN 0		ELSE c2.VM_RetCards_Score_C2	END AS 'VM_RetCards_Score_C2'
+		, CASE	WHEN c2.VM_UL_Score_C2 IS NULL THEN 0			ELSE c2.VM_UL_Score_C2			END AS 'VM_UL_Score_C2'
+		, CASE	WHEN c2.VM_VF_HP_Score_C2 IS NULL THEN 0		ELSE c2.VM_VF_HP_Score_C2		END AS 'VM_VF_HP_Score_C2'
+		, CASE	WHEN c2.VM_SL_Score_C2 IS NULL THEN 0			ELSE c2.VM_SL_Score_C2			END AS 'VM_SL_Score_C2'
+		, CASE	WHEN c2.VM_MG_Score_C2 IS NULL THEN 0			ELSE c2.VM_MG_Score_C2			END AS 'VM_MG_Score_C2'
+		, CASE	WHEN c2.VM_CA_Score_C2 IS NULL THEN 0			ELSE c2.VM_CA_Score_C2			END AS 'VM_CA_Score_C2'
+		, CASE	WHEN c2.VM_UT_Score_C2 IS NULL THEN 0			ELSE c2.VM_UT_Score_C2			END AS 'VM_UT_Score_C2'
+		, CASE	WHEN c2.VM_HS_Score_C2 IS NULL THEN 0			ELSE c2.VM_HS_Score_C2			END AS 'VM_HS_Score_C2'
+		, CASE	WHEN c2.HC_Score_C2 IS NULL THEN 0				ELSE c2.HC_Score_C2				END AS 'HC_Score_C2'
+		, CASE	WHEN c2.PDL_Score_C2 IS NULL THEN 0				ELSE c2.PDL_Score_C2			END AS 'PDL_Score_C2'
+		, CASE	WHEN c2.BankIVAPIR_Score_C2 IS NULL THEN 0		ELSE c2.BankIVAPIR_Score_C2		END AS 'BankIVAPIR_Score_C2'
+ 		, CASE	WHEN c2.NPD_EB_Score_C2 IS NULL THEN 0			ELSE c2.NPD_EB_Score_C2			END AS 'NPD_EB_Score_C2'
+		, CASE	WHEN c2.CIFAS_Score_C2 IS NULL THEN 0			ELSE c2.CIFAS_Score_C2			END AS 'CIFAS_Score_C2'	 
+
+FROM	CTE_C1 c1
+LEFT JOIN	CTE_C2 c2
+ON	c1.AccountNumber=c2.AccountNumber
+),
+
+CTE_App AS 
+(
+SELECT	m.*
+		, CASE	WHEN m.CII_C2>m.CII_C1 THEN m.CII_C2 ELSE m.CII_C1 END AS 'CII_App'
+		, CASE	WHEN m.AAM_C2>m.AAM_C1 THEN m.AAM_C2 ELSE m.AAM_C1 END AS 'AAM_App'
+		, CASE	WHEN m.CLU_Score_C2>m.CLU_Score_C1 THEN m.CLU_Score_C2 ELSE m.CLU_Score_C1 END AS 'CLU_Score_App'
+		, CASE	WHEN m.BDS_Score_C2>m.BDS_Score_C1 THEN m.BDS_Score_C2 ELSE m.BDS_Score_C1 END AS 'BDS_Score_App'
+		, CASE	WHEN m.VM_BankCards_Score_C2>m.VM_BankCards_Score_C1 THEN m.VM_BankCards_Score_C2 ELSE m.VM_BankCards_Score_C1 END AS 'VM_BankCards_Score_App'
+		, CASE	WHEN m.VM_CSA_Score_C2>m.VM_CSA_Score_C1 THEN m.VM_CSA_Score_C2 ELSE m.VM_CSA_Score_C1 END AS 'VM_CSA_Score_App'
+		, CASE	WHEN m.VM_RetCards_Score_C2>m.VM_RetCards_Score_C1 THEN m.VM_RetCards_Score_C2 ELSE m.VM_RetCards_Score_C1 END AS 'VM_RetCards_Score_App'
+		, CASE	WHEN m.VM_UL_Score_C2>m.VM_UL_Score_C1 THEN m.VM_UL_Score_C2 ELSE m.VM_UL_Score_C1 END AS 'VM_UL_Score_App'
+		, CASE	WHEN m.VM_VF_HP_Score_C2>m.VM_VF_HP_Score_C1 THEN m.VM_VF_HP_Score_C2 ELSE m.VM_VF_HP_Score_C1 END AS 'VM_VF_HP_Score_App'
+		, CASE	WHEN m.VM_SL_Score_C2>m.VM_SL_Score_C1 THEN m.VM_SL_Score_C2 ELSE m.VM_SL_Score_C1 END AS 'VM_SL_Score_App'
+		, CASE	WHEN m.VM_MG_Score_C2>m.VM_MG_Score_C1 THEN m.VM_MG_Score_C2 ELSE m.VM_MG_Score_C1 END AS 'VM_MG_Score_App'
+		, CASE	WHEN m.VM_CA_Score_C2>m.VM_CA_Score_C1 THEN m.VM_CA_Score_C2 ELSE m.VM_CA_Score_C1 END AS 'VM_CA_Score_App'
+		, CASE	WHEN m.VM_UT_Score_C2>m.VM_UT_Score_C1 THEN m.VM_UT_Score_C2 ELSE m.VM_UT_Score_C1 END AS 'VM_UT_Score_App'
+		, CASE	WHEN m.VM_HS_Score_C2>m.VM_HS_Score_C1 THEN m.VM_HS_Score_C2 ELSE m.VM_HS_Score_C1 END AS 'VM_HS_Score_App'
+		, CASE	WHEN m.HC_Score_C2>m.HC_Score_C1 THEN m.HC_Score_C2 ELSE m.HC_Score_C1 END AS 'HC_Score_App'
+		, CASE	WHEN m.PDL_Score_C2>m.PDL_Score_C1 THEN m.PDL_Score_C2 ELSE m.PDL_Score_C1 END AS 'PDL_Score_App'
+		, CASE	WHEN m.BankIVAPIR_Score_C2>m.BankIVAPIR_Score_C1 THEN m.BankIVAPIR_Score_C2 ELSE m.BankIVAPIR_Score_C1 END AS 'BankIVAPIR_Score_App'
+		, CASE	WHEN m.NPD_EB_Score_C2>m.NPD_EB_Score_C1 THEN m.NPD_EB_Score_C2 ELSE m.NPD_EB_Score_C1 END AS 'NPD_EB_Score_App'
+		, CASE	WHEN m.CIFAS_Score_C2>m.CIFAS_Score_C1 THEN m.CIFAS_Score_C2 ELSE m.CIFAS_Score_C1 END AS 'CIFAS_Score_App'
+	
+FROM	CTE_Merge m
+)
+,
+
+CTE_Final AS
+(SELECT	a.AccountNumber, a.Lending, a.ExpData, a.Cust2Data, a.GD_Index, a.GD_BTLProxy2/*, a.Period, a.PostCode*/
+		, a.CLU_Score_App+a.BDS_Score_App+a.VM_BankCards_Score_App+a.VM_CSA_Score_App+a.VM_RetCards_Score_App+a.VM_UL_Score_App+a.VM_VF_HP_Score_App+a.VM_SL_Score_App+a.VM_MG_Score_App+a.VM_CA_Score_App+a.VM_UT_Score_App
+		+a.VM_HS_Score_App+a.HC_Score_App+a.PDL_Score_App+a.BankIVAPIR_Score_App+a.NPD_EB_Score_App+a.CIFAS_Score_App AS BureauRiskScore 
+		, a.CII_App, a.AAM_App, a.CLU_Score_App, a.BDS_Score_App, a.VM_BankCards_Score_App, a.VM_CSA_Score_App, a.VM_RetCards_Score_App, a.VM_UL_Score_App, a.VM_VF_HP_Score_App, a.VM_SL_Score_App, a.VM_MG_Score_App, a.VM_CA_Score_App
+		, a.VM_UT_Score_App, a.VM_HS_Score_App, a.HC_Score_App, a.PDL_Score_App, a.BankIVAPIR_Score_App, a.NPD_EB_Score_App, a.CIFAS_Score_App
+		 
+FROM	CTE_App a 
+)
+
+SELECT	f.* 
+FROM	CTE_Final f
+/*WHERE	(f.Lending='Resi' AND f.BureauRiskScore>=&GBRS)
+		OR (f.Lending='BTL' AND (f.BureauRiskScore>=&GBRS OR (f.BureauRiskScore>=&SBRS AND f.GD_Index>=&BGD)))*/
+ORDER BY	f.AccountNumber
+)
+;
+DISCONNECT FROM odbc;
+quit;
+
+
+
+/*Step 5: Previous contacts that can/cannot be reached again*/
+data Resi_hist; set out.Resi_hist; drop Segment; run;
+proc sort data=Resi_hist; by AccountNumber descending SSContact; run;
+data Resi_hist_dd; set Resi_hist; by AccountNumber; if first.AccountNumber; run;
+data Resi_Barred; set Resi_hist_dd; if SSContact>&lagp; run; 
+data Resi_Requal; set Resi_hist_dd; if SSContact<=&lagp; run; 
+
+/*data BTL_hist; set out.Resi_hist; if AccountNumber=1; drop Segment; run;*/ /*In the meantime BTL strategy is on hold*/
+data BTL_hist; set out.BTL_hist; drop Segment; run; 
+proc sort data=BTL_hist; by AccountNumber descending SSContact; run;
+data BTL_hist_dd; set BTL_hist; by AccountNumber; if first.AccountNumber; run;
+data BTL_Barred; set BTL_hist_dd; if SSContact>&lagp; run; 
+data BTL_Requal; set BTL_hist_dd; if SSContact<=&lagp; run; 
+
+data Barred; set Resi_Barred BTL_Barred; Barred=1; format Barred 1.; drop SSContact; run;
+proc sort data=Barred; by AccountNumber; run;
+data Requal; set Resi_Requal BTL_Requal; Requal=1; format Requal 1.; drop SSContact; run;
+proc sort data=Requal; by AccountNumber; run;
+
+proc delete data=Resi_hist Resi_hist_dd BTL_hist BTL_hist_dd Resi_Barred BTL_Barred Resi_Requal BTL_Requal; run;
+
+
+
+/*Step 6: Data merge, exclusions, cut-offs and target*/
+data	Acc&ss;
+merge	SS&ss(in=a) Prep&ss(in=b) DDR&ss(in=c) BR&ss(in=d) Barred(in=e) Requal(in=f);
+by		AccountNumber;
+if		a;
+if		AB2X_pre12m=0 and ArrBelow1MIA=0 and RS_Ind=1 then delete; /*Removes accounts with a redemption statement requested and not in arrears*/
+if		DDR=1 then delete; /*Removes accounts targeted for contact from Direct Debit Rejections Strategy*/ 
+if		Barred=1 then delete; /*Removes accounts that have been contacted within last four months*/
+if		Requal=1 then Requal=1; else Requal=0; format Requal 1.; /*Accounts that can be contacted again*/
+if		MIA1X_pre12m=1 then G1=1; else G1=0; format G1 1.;
+if		MIA1X_pre12m=0 and (AB2X_pre12m=1 or (AB1X_pre12m=1 and ArrBelow1MIA=1)) then G2=1; else G2=0; format G2 1.;
+if		G1=0 and G2=0 and ExpData=1 then G3=1; else G3=0; format G3 1.;
+Group='  ';
+if		G1=1 then Group='G1'; else if G2=1 then Group='G2'; else if G3=1 then Group='G3'; else Group='NA';
+if		Group in ('G1' 'G2' 'G3');
+run;
+proc delete data=SS&ss Prep&ss /*DDR&ss*/ BR&ss Barred Requal; run;
+
+data	Qual&ss;
+set		Acc&ss;
+if		Segment='Resi' and Group='G1' and BH_Score<=&RG1BS then Qualifyer=1; /*Resi G1 Behavioral Score Cut-Off*/
+else if Segment='Resi' and Group='G2' and BH_Score<=&RG2BS then Qualifyer=1; /*Resi G2 Behavioral Score Cut-Off*/
+else if Segment='Resi' and Group='G3' and BureauRiskScore>=&GBRS then Qualifyer=1; /*General Bureau Risk Score Cut-Off*/
+else if	Segment='BTL' and Group='G1' and BH_Score<=&BG1BS then Qualifyer=1; /*Resi G1 Behavioral Score Cut-Off*/
+else if Segment='BTL' and Group='G2' and BH_Score<=&BG2BS then Qualifyer=1; /*Resi G2 Behavioral Score Cut-Off*/
+else if Segment='BTL' and Group='G3' and (BureauRiskScore>=&GBRS or (BureauRiskScore>=&SBRS and GD_Index>=&BGD)) then Qualifyer=1; /*BTL Bureau Risk Score and Geo-Delphi criterion*/
+else	Qualifyer=0; format Qualifyer 1.; 
+if	Qualifyer=1;
+run;
+
+data Qual_Resi&ss; set Qual&ss; if Segment='Resi'; run;
+data Qual_B&ss; set Qual&ss; if Segment='BTL'; run;
+
+proc delete data=Acc&ss Qual&ss; run;
+
+
+
+/*Step 7: Portfolio landlord and highest customer exposure per BTL account*/
+proc sql;
+CONNECT TO odbc	("server=SBSPSQLVS101\MISPSQL01;
+				driver=sql server; 
+                database=p_dw; 
+                trusted connection=yes;");
+
+/*Step 7.1: Accounts With Existing Number of BTLs>=4*/
+CREATE TABLE EXBTL AS 
+SELECT * FROM CONNECTION TO ODBC
+(
+SELECT	a.AccountNumber, a.TotalBTLs
+FROM	(SELECT	da.AccountNumber
+				, dma.NumberOfExistingBuyToLets 'TotalBTLs'
+				, RANK() OVER (PARTITION BY da.AccountNumber ORDER BY da.AccountStartDate DESC, dma.BK_MOR98 DESC) 'Ranking' /*Also considers later ABs with updated existing BTLs figures*/
+
+		FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+		INNER JOIN	P_DW.dbo.dimAccount da
+		ON	fma.FK_Account = da.PK_Account
+		INNER JOIN	P_DW.dbo.dimProduct dp
+		ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+		INNER JOIN	P_DW.dbo.dimAccountStates das
+		ON	fma.FK_AccountStates = das.PK_AccountStates
+		INNER JOIN	P_DW.dbo.dimMonth dm
+		ON	fma.FK_SnapshotDate = dm.PK_Month
+		LEFT JOIN	P_DW.dbo.bridgeMortgageApplicationAccount bmaa
+		ON	da.PK_Account = bmaa.FK_Account
+		AND	bmaa.isProgressedApplication='Y'
+		LEFT JOIN	P_DW.dbo.dimMortgageApplication dma
+		ON	bmaa.FK_MortgageApplication = dma.PK_MortgageApplication
+		AND	dma.BK_MOR98 <> 'Unknown' /*Removes Applications with no link to MOR98*/
+
+		WHERE	da.AccountPool='SBS00001'
+		AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&ss)
+		AND		da.AccountSubType='Primary'
+		AND		da.CurrentAccountClassification='Residential'
+		AND		das.AccountStatus IN ('Live')
+		AND		fma.CapitalBalanceLive>1000
+		AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125') /*SBS deed accounts + Holmesdale deed and fair value accounts*/
+		)a
+
+WHERE	a.Ranking=1 
+AND		a.TotalBTLs>=4
+
+ORDER BY a.AccountNumber
+);
+
+
+/*Step 7.2: Dedup list of BTL accounts linked to customers with 4+ BTLs with SBS*/
+CREATE TABLE SBSPL AS 
+SELECT * FROM CONNECTION TO ODBC
+(
+SELECT	DISTINCT da.AccountNumber, 1 AS 'SBS_PL'
+		
+FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	fma.FK_Account = da.PK_Account
+INNER JOIN	P_DW.dbo.bridgeAccountCustomer bac
+ON	da.PK_Account = bac.FK_Account
+AND	bac.relationshipTypeCode=19
+INNER JOIN	P_DW.dbo.dimCustomer dc
+ON	bac.FK_Customer = dc.PK_Customer
+INNER JOIN	P_DW.dbo.dimProduct dp
+ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+INNER JOIN	P_DW.dbo.dimAccountStates das
+ON	fma.FK_AccountStates = das.PK_AccountStates
+INNER JOIN	P_DW.dbo.dimMonth dm
+ON	fma.FK_SnapshotDate = dm.PK_Month
+INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+
+WHERE	da.AccountPool='SBS00001'
+AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&ss)
+AND		da.AccountSubType='Primary'
+AND		da.CurrentAccountClassification='Residential'
+AND		das.AccountStatus IN ('Live','Possession')
+AND		dsp.SubPopulationCode='BTL'
+AND		fma.CapitalBalanceLive>1000
+AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125') 
+AND		dc.CustomerNumber IN	(/*List of customers with 4+BTLs with Skipton*/
+								SELECT	b.CustomerNumber
+								FROM	(/*List of BTL account holders and number of BTLs*/
+										SELECT	a.CustomerNumber
+												, CASE WHEN COUNT(a.AccountNumber)>=4 THEN 1 ELSE 0 END AS 'SBS_4PlusBTL'
+										FROM	(/*List of BTL accounts and associated account holders*/
+												SELECT	dc.CustomerNumber
+														, da.AccountNumber
+														, fma.CapitalBalanceLive
+
+												FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+												INNER JOIN	P_DW.dbo.dimAccount da
+												ON	fma.FK_Account = da.PK_Account
+												INNER JOIN	P_DW.dbo.bridgeAccountCustomer bac
+												ON	da.PK_Account = bac.FK_Account
+												AND	bac.relationshipTypeCode=19
+												INNER JOIN	P_DW.dbo.dimCustomer dc
+												ON	bac.FK_Customer = dc.PK_Customer
+												INNER JOIN	P_DW.dbo.dimProduct dp
+												ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+												INNER JOIN	P_DW.dbo.dimAccountStates das
+												ON	fma.FK_AccountStates = das.PK_AccountStates
+												INNER JOIN	P_DW.dbo.dimMonth dm
+												ON	fma.FK_SnapshotDate = dm.PK_Month
+												INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+												ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+
+												WHERE	da.AccountPool='SBS00001'
+												AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&ss)
+												AND		da.AccountSubType='Primary'
+												AND		da.CurrentAccountClassification='Residential'
+												AND		das.AccountStatus IN ('Live','Possession')
+												AND		dsp.SubPopulationCode='BTL'
+												AND		fma.CapitalBalanceLive>1000
+												AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125') 
+												)a
+										GROUP BY a.CustomerNumber
+										)b
+								WHERE	b.SBS_4PlusBTL=1
+								)
+ORDER BY da.AccountNumber
+);
+
+/*Step 7.3: Accounts which have declared 4+mortgaged properties at completion*/
+CREATE TABLE NewL_PL AS 
+SELECT * FROM CONNECTION TO ODBC
+(
+SELECT	AccountNumber, 1 AS 'NewL_PL'
+FROM	(SELECT	dma.AccountNumberPrimary 'AccountNumber'
+				, CONVERT(VARCHAR,dma.ApplicationReference)+'/'+CONVERT(VARCHAR,dma.ApplicationNumber) 'ApplicationNumber'
+				, s.BK_MortgageApplication
+				, dma.PK_MortgageApplication
+				, s.Application_Type
+				, CONVERT(DATE,dacd.CalendarDate) AS 'DIP_Date'
+				, CONVERT(DATE,dad.CalendarDate) AS 'App_Date'
+				, CONVERT(DATE,dcad.CalendarDate) AS 'Cancellation_Date'
+				, CONVERT(DATE,dcod.CalendarDate) AS 'Completion_Date'
+				, RANK() OVER(PARTITION BY s.PrimaryAccountNumber ORDER BY	dcad.CalendarDate DESC, dcod.CalendarDate DESC, (CASE WHEN s.Application_Type IN ('D1','B1','C1') THEN 1 
+																			WHEN s.Application_Type='D2' THEN 2	WHEN s.Application_Type='PA' THEN 3	WHEN s.Application_Type='FC' THEN 4 
+																			WHEN s.Application_Type='FD' THEN 5 WHEN s.Application_Type='FA' THEN 6 END) DESC) AS 'LatestApp' 
+				, s.Request_Time
+				, CASE WHEN s.appSpareNumeric43<=0 THEN 0 ELSE CONVERT(INT,s.appSpareNumeric43) END AS 'NoMortProp'
+			
+		FROM	P_DW.dbo.factMortgageApplication fma
+
+		INNER JOIN	P_DW.dbo.dimMortgageApplication dma
+		ON	fma.FK_MortgageApplication = dma.PK_MortgageApplication
+		INNER JOIN	P_DW.dbo.dimDate dacd
+		ON	fma.FK_ApplicationCreateDate = dacd.PK_Date
+		INNER JOIN	P_DW.dbo.dimDate dad
+		ON	fma.FK_ApplicationDate = dad.PK_Date
+		INNER JOIN	P_DW.dbo.dimDate dfod
+		ON	fma.FK_Date_OfferFirst = dfod.PK_Date
+		INNER JOIN	P_DW.dbo.dimDate dlod
+		ON	fma.FK_Date_OfferLatest = dlod.PK_Date
+		INNER JOIN	P_DW.dbo.dimDate dcad
+		ON	fma.FK_DateCancelled = dcad.PK_Date
+		INNER JOIN	P_DW.dbo.dimDate dcod
+		ON	fma.FK_DateCompleted = dcod.PK_Date
+		INNER JOIN	P_ODS.CREDIT_RISK.vwMortgageAppCreditScore_Latest s
+		ON	CONVERT(VARCHAR,dma.ApplicationReference)+'/'+CONVERT(VARCHAR,dma.ApplicationNumber)=s.ApplicationNumber
+
+		WHERE	s.Application_Type IN ('D1','B1','C1','D2','PA','FD','FA','FC')
+		AND		dacd.CalendarDate>='2018-02-01'
+		AND		dcod.CalendarDate>='2018-02-01'
+		AND		dcad.CalendarDate='1900-01-01 00:00:00.000'
+		AND		s.appSpareNumeric43>=4
+		)a
+WHERE	a.LatestApp=1
+ORDER BY AccountNumber
+);
+
+/*Step 7.4: Higher customer exposure per BTL account*/ 
+/*List of BTL accounts with associated account holders*/
+CREATE TABLE HighestExp AS 
+SELECT * FROM CONNECTION TO ODBC
+(
+WITH CTE_BTLCus AS 
+(
+SELECT	da.AccountNumber
+		, dc.CustomerNumber
+		, CASE WHEN bac.isPrimaryCustomer='Y' THEN 1 ELSE 0 END AS 'PrimCust'
+
+FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	fma.FK_Account = da.PK_Account
+INNER JOIN	P_DW.dbo.bridgeAccountCustomer bac
+ON	da.PK_Account = bac.FK_Account
+AND	bac.relationshipTypeCode=19
+INNER JOIN	P_DW.dbo.dimCustomer dc
+ON	bac.FK_Customer = dc.PK_Customer
+INNER JOIN	P_DW.dbo.dimProduct dp
+ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+INNER JOIN	P_DW.dbo.dimAccountStates das
+ON	fma.FK_AccountStates = das.PK_AccountStates
+INNER JOIN	P_DW.dbo.dimMonth dm
+ON	fma.FK_SnapshotDate = dm.PK_Month
+INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+
+WHERE	da.AccountPool='SBS00001'
+AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&ss)
+AND		da.AccountSubType='Primary'
+AND		da.CurrentAccountClassification='Residential'
+AND		das.AccountStatus IN ('Live','Possession')
+AND		dsp.SubPopulationCode='BTL'
+AND		fma.CapitalBalanceLive>1000
+AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125')
+)
+
+SELECT	he.AccountNumber, he.CustomerNumber, he.PrimCust, he.CustDecL12m, he.CustDec, he.BTL_Acc, he.Resi_Acc, he.BTL_Bal, he.Resi_Bal, he.CombBal
+FROM	(SELECT	c.AccountNumber, c.CustomerNumber, c.PrimCust, e.CustDecL12m, e.CustDec, e.BTL_Acc, e.Resi_Acc, e.BTL_Bal, e.Resi_Bal, e.CombBal
+				, RANK() OVER(PARTITION BY c.AccountNumber ORDER BY e.CustDecL12m ASC, e.CustDec ASC, e.CombBal DESC, c.PrimCust DESC, c.CustomerNumber ASC) AS HighestExp
+		FROM	(/*Combined SBS exposure (BTL and no BTL) for every customer associated to a BTL account, grouped at customer level*/
+				SELECT	a.CustomerNumber
+						, SUM(a.CustDecL12m) AS 'CustDecL12m'
+						, SUM(a.CustDec) AS 'CustDec'
+						, SUM(a.BTL) AS 'BTL_Acc'
+						, SUM(a.Resi) AS 'Resi_Acc'
+						, SUM(a.BTL_Bal) AS 'BTL_Bal'
+						, SUM(a.Resi_Bal) AS 'Resi_Bal'
+						, SUM(a.CapitalBalanceLive) AS 'CombBal'
+
+				FROM	(/*All accounts (BTL and no BTL) and balances associated to customers with at least 1 BTL*/
+						SELECT	dc.CustomerNumber
+								, CASE WHEN dc.CustomerDateofDeath IS NOT NULL AND DATEDIFF(MONTH,dc.CustomerDateofDeath,GETDATE())<=12 THEN 1 ELSE 0 END AS 'CustDecL12m'
+								, CASE WHEN dc.CustomerDateofDeath IS NOT NULL THEN 1 ELSE 0 END AS 'CustDec'
+								, da.AccountNumber
+								, CASE WHEN dsp.SubPopulationCode='BTL' THEN 1 ELSE 0 END AS 'BTL'
+								, CASE WHEN dsp.SubPopulationCode<>'BTL' THEN 1 ELSE 0 END AS 'Resi'
+								, CASE WHEN dsp.SubPopulationCode='BTL' THEN fma.CapitalBalanceLive ELSE 0 END AS 'BTL_Bal'
+								, CASE WHEN dsp.SubPopulationCode<>'BTL' THEN fma.CapitalBalanceLive ELSE 0 END AS 'Resi_Bal'
+								, fma.CapitalBalanceLive
+
+						FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+						INNER JOIN	P_DW.dbo.dimAccount da
+						ON	fma.FK_Account = da.PK_Account
+						INNER JOIN	P_DW.dbo.bridgeAccountCustomer bac
+						ON	da.PK_Account = bac.FK_Account
+						AND	bac.relationshipTypeCode=19
+						INNER JOIN	P_DW.dbo.dimCustomer dc
+						ON	bac.FK_Customer = dc.PK_Customer
+						INNER JOIN	P_DW.dbo.dimProduct dp
+						ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+						INNER JOIN	P_DW.dbo.dimAccountStates das
+						ON	fma.FK_AccountStates = das.PK_AccountStates
+						INNER JOIN	P_DW.dbo.dimMonth dm
+						ON	fma.FK_SnapshotDate = dm.PK_Month
+						INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+						ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+
+						WHERE	da.AccountPool='SBS00001'
+						AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&ss)
+						AND		da.AccountSubType='Primary'
+						AND		da.CurrentAccountClassification='Residential'
+						AND		das.AccountStatus IN ('Live','Possession')
+						AND		fma.CapitalBalanceLive>1000
+						AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125')
+						AND		dc.CustomerNumber IN	(/*Dedup list of BTL account holders*/
+														SELECT DISTINCT	dc.CustomerNumber
+
+														FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+														INNER JOIN	P_DW.dbo.dimAccount da
+														ON	fma.FK_Account = da.PK_Account
+														INNER JOIN	P_DW.dbo.bridgeAccountCustomer bac
+														ON	da.PK_Account = bac.FK_Account
+														AND	bac.relationshipTypeCode=19
+														INNER JOIN	P_DW.dbo.dimCustomer dc
+														ON	bac.FK_Customer = dc.PK_Customer
+														INNER JOIN	P_DW.dbo.dimProduct dp
+														ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+														INNER JOIN	P_DW.dbo.dimAccountStates das
+														ON	fma.FK_AccountStates = das.PK_AccountStates
+														INNER JOIN	P_DW.dbo.dimMonth dm
+														ON	fma.FK_SnapshotDate = dm.PK_Month
+														INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+														ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+
+														WHERE	da.AccountPool='SBS00001'
+														AND		dm.CalendarMonthYear=CONVERT(VARCHAR,&ss)
+														AND		da.AccountSubType='Primary'
+														AND		da.CurrentAccountClassification='Residential'
+														AND		das.AccountStatus IN ('Live','Possession')
+														AND		dsp.SubPopulationCode='BTL'
+														AND		fma.CapitalBalanceLive>1000
+														AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125')
+														)
+						)a
+				GROUP BY a.CustomerNumber
+				)e
+		INNER JOIN CTE_BTLCus c
+		ON e.CustomerNumber = c.CustomerNumber
+		)he
+WHERE	he.HighestExp=1
+ORDER BY he.AccountNumber
+);
+DISCONNECT FROM odbc;
+quit;
+
+
+data	Qual_B&ss;
+merge	Qual_B&ss(in=a) HighestExp(in=b) SBSPL(in=c) NewL_PL(in=d) EXBTL(in=e);
+by		AccountNumber;
+if		SBS_PL=. then SBS_PL=0; else SBS_PL=SBS_PL; format SBS_PL 1.; 
+if		NewL_PL=. then NewL_PL=0; else NewL_PL=NewL_PL; format NewL_PL 1.;
+if		TotalBTLs=. then TotalBTLs=0; else TotalBTLs=TotalBTLs; format TotalBTLs 2.;
+if		SBS_PL=1 OR NewL_PL=1 then PL_True=1; else PL_True=0; format PL_True 1.;
+if		PL_True=0 AND TotalBTLs>=4 then PL_Proxy=1; else PL_Proxy=0; format PL_Proxy 1.;
+if		a;
+if		CustDecL12m>0 or CustDec>0 then delete;
+run;
+proc delete data= HighestExp SBSPL NewL_PL EXBTL; run;
+
+
+/*Resi targets*/
+data RG1S; set Qual_Resi&ss; if Group='G1' and Lender='SBS'; run; 
+proc sort data=RG1S; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data RG1S; set RG1S; Order+1; format Order 4.; if Order<=&RG1Max; run;
+data RG1A; set Qual_Resi&ss; if Group='G1' and Lender ne 'SBS'; run; 
+proc sort data=RG1A; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data RG1A; set RG1A; Order+1; format Order 4.; if Order<=&RG1Max; run;
+
+
+data RG2S; set Qual_Resi&ss; if Group='G2' and Lender='SBS'; run; 
+proc sort data=RG2S; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data RG2S; set RG2S; Order+1; format Order 4.; if Order<=&RG2Max; run;
+data RG2A; set Qual_Resi&ss; if Group='G2' and Lender ne 'SBS'; run; 
+proc sort data=RG2A; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data RG2A; set RG2A; Order+1; format Order 4.; if Order<=&RG2Max; run;
+
+data RG3S; set Qual_Resi&ss; if Group='G3' and Lender='SBS'; run; 
+proc sort data=RG3S; by Requal descending BureauRiskScore BH_Score AAM_App descending BalSS AccountNumber; run; 
+data RG3S; set RG3S; Order+1; format Order 4.; if Order<=&RG3Max; run;
+data RG3A; set Qual_Resi&ss; if Group='G3' and Lender ne 'SBS'; run; 
+proc sort data=RG3A; by Requal descending BureauRiskScore BH_Score AAM_App descending BalSS AccountNumber; run; 
+data RG3A; set RG3A; Order+1; format Order 4.; if Order<=&RG3Max; run;
+
+/*Resi target table that will update contact history*/
+data R_Target; set RG1S RG1A RG2S RG2A RG3S RG3A; SSContact=Snapshot; keep AccountNumber Segment SSContact; run;
+
+
+/*BTL Targets*/
+data BG1S; set Qual_B&ss; if Group='G1' and Lender='SBS'; run; 
+proc sort data=BG1S; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data BG1S; set BG1S; Order+1; format Order 4.; if Order<=&BG1Max; run;
+data BG1A; set Qual_B&ss; if Group='G1' and Lender ne 'SBS'; run; 
+proc sort data=BG1A; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data BG1A; set BG1A; Order+1; format Order 4.; if Order<=&BG1Max; run;
+
+data BG2S; set Qual_B&ss; if Group='G2' and Lender='SBS'; run; 
+proc sort data=BG2S; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data BG2S; set BG2S; Order+1; format Order 4.; if Order<=&BG2Max; run;
+data BG2A; set Qual_B&ss; if Group='G2' and Lender ne 'SBS'; run; 
+proc sort data=BG2A; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data BG2A; set BG2A; Order+1; format Order 4.; if Order<=&BG2Max; run;
+
+data BG3S; set Qual_B&ss; if Group='G3' and Lender='SBS'; run; 
+proc sort data=BG3S; by Requal descending BureauRiskScore GD_BTLProxy2 descending GD_Index BH_Score AAM_App descending BalSS AccountNumber; run; 
+data BG3S; set BG3S; Order+1; format Order 4.; if Order<=&BG3Max; run;
+data BG3A; set Qual_B&ss; if Group='G3' and Lender ne 'SBS'; run; 
+proc sort data=BG3A; by Requal descending BureauRiskScore GD_BTLProxy2 descending GD_Index BH_Score AAM_App descending BalSS AccountNumber; run; 
+data BG3A; set BG3A; Order+1; format Order 4.; if Order<=&BG3Max; run;
+
+/*BTL target table that will update contact history*/
+data B_Target; set BG1S BG1A BG2S BG2A BG3S BG3A; SSContact=Snapshot; keep AccountNumber Segment SSContact; run;
+
+
+/*Combining SBS and AHL/NYM target accounts within the corresponding Resi/BTL groups*/
+data RG1; set RG1S RG1A; run;
+proc sort data=RG1; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data RG2; set RG2S RG2A; run;
+proc sort data=RG2; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data RG3; set RG3S RG3A; run;
+proc sort data=RG3; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run;
+
+data BG1; set BG1S BG1A; run;
+proc sort data=BG1; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data BG2; set BG2S BG2A; run;
+proc sort data=BG2; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+data BG3; set BG3S BG3A; run;
+proc sort data=BG3; by Requal BH_Score descending MIASS descending BureauRiskScore AAM_App; run; 
+
+proc delete data= RG1S RG1A RG2S RG2A RG3S RG3A BG1S BG1A BG2S BG2A BG3S BG3A; run;
+
+
+/*Step 8: Dialler specs*/
+/*Step 8.1: Customer data*/
+proc sql;
+CONNECT TO odbc	("server=SBSPSQLVS101\MISPSQL01;
+				driver=sql server; 
+                database=p_dw; 
+                trusted connection=yes;");
+CREATE TABLE D1 AS 
+SELECT * FROM CONNECTION TO ODBC
+(
+SELECT	da.AccountNumber
+		, dc.CustomerNumber
+		, fma.CapitalBalanceLive AS 'Balance'
+		, CASE WHEN dsp.SubPopulationCode='BTL' THEN 'BTL' ELSE 'Resi' END AS 'LendingType'
+		, da.AccountNumber 'IACCNBRO'
+		, dc.CustomerNumber 'Custnbro'
+		, dc.CustomerTitle 'Mretcu'	
+		, dc.CustomerForename 'Firnameu'	
+		, dc.CustomerSurname 'Surnameu'	
+		, CASE WHEN bac.isPrimaryCustomer='Y' THEN 1 ELSE 0 END AS 'PrimCustFlag'
+		, dc.CustomerTelephoneDay 
+		, dc.CustomerTelephoneEvening
+		, dc.CustomerTelephoneMobile
+
+FROM	P_DW.dbo.factMortgageAccountMonthSS fma
+
+INNER JOIN	P_DW.dbo.dimAccount da
+ON	fma.FK_Account = da.PK_Account
+INNER JOIN	P_DW.dbo.bridgeAccountCustomer bac
+ON	da.PK_Account = bac.FK_Account
+AND	bac.relationshipTypeCode='19'
+AND	bac.DeLinkDate IS NULL
+INNER JOIN	P_DW.dbo.dimCustomer dc
+ON	bac.FK_Customer = dc.PK_Customer
+INNER JOIN	P_DW.dbo.dimMonth dm
+ON	fma.FK_SnapshotDate = dm.PK_Month
+INNER JOIN	P_DW.dbo.dimAccountStates das
+ON	fma.FK_AccountStates = das.PK_AccountStates
+INNER JOIN	P_DW.dbo.dimProduct dp
+ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+INNER JOIN	P_DW.dbo.dimArrangement dar
+ON	fma.FK_ArrangementType = dar.PK_ArrangementType
+INNER JOIN	P_DW.dbo.dimSubPopulation dsp
+ON	fma.FK_SubPopulation = dsp.PK_SubPopulation
+
+WHERE	dm.CalendarMonthYear=CONVERT(VARCHAR,&ss)
+AND		da.AccountPool='SBS00001'
+AND		da.AccountSubType='Primary'
+AND		das.AccountStatus IN ('Live')
+AND		da.CurrentAccountClassification='Residential'
+AND		dp.ProductCode NOT IN ('MIN01','HOM10','HM120','HM121','HM122','HM123','HM124','HM125') /*SBS deed accounts + Holmesdale deed and fair value accounts*/
+AND		fma.ContractualArrearsInMonths<1 
+AND		fma.CapitalBalanceLive>1000
+AND		dar.ArrangementTypeCode<0 /*Removes accounts with an arrangement in place*/
+AND		DATEDIFF(MONTH,da.AccountStartDate,DATEADD(MONTH,0,dm.ReportingMonth))>3 /*Removes up to three months of recent completions*/
+AND		fma.RemainingTerm>12 /*Removes passed term accounts and those that will mature within the next 12 months*/
+AND		da.AccountNumber NOT IN (/*Removes accounts where one of the account holders is deceased*/
+								SELECT	b.AccountNumber
+								FROM	(SELECT	a.AccountNumber
+												, SUM(a.DeathFlag) AS 'DeathFlag'
+										FROM	(SELECT	da.AccountNumber
+														, dc.CustomerNumber
+														, CASE WHEN dc.CustomerDateofDeath IS NOT NULL THEN 1 ELSE 0 END AS 'DeathFlag'
+										
+												FROM	P_DW.dbo.factMortgageAccount fma
+
+												INNER JOIN	P_DW.dbo.dimAccount da
+												ON	fma.FK_Account = da.PK_Account
+												INNER JOIN	P_DW.dbo.bridgeAccountCustomer bac
+												ON	da.PK_Account = bac.FK_Account
+												AND	bac.relationshipTypeCode='19'
+												INNER JOIN	P_DW.dbo.dimCustomer dc
+												ON	bac.FK_Customer = dc.PK_Customer
+												INNER JOIN	P_DW.dbo.dimProduct dp
+												ON	fma.FK_CurrentMortgageProduct = dp.PK_Product
+
+												WHERE	da.AccountPool='SBS00001'
+												AND		da.AccountSubType='Primary'
+												AND		da.CurrentAccountStatus IN ('Live')
+												AND		da.CurrentAccountClassification='Residential'
+												)a
+										GROUP BY a.AccountNumber 
+										)b
+								WHERE	b.DeathFlag>0
+								)
+ORDER BY da.AccountNumber
+)
+;
+DISCONNECT FROM odbc;
+quit;
+
+
+/*Step 8.2: Refining data*/
+/*Removing anything other than numbers*/
+data	D2;
+set		D1;
+TelephoneDay=COMPRESS(CustomerTelephoneDay,'0123456789','k');
+TelephoneEvening=COMPRESS(CustomerTelephoneEvening,'0123456789','k');
+TelephoneMobile=COMPRESS(CustomerTelephoneMobile,'0123456789','k');
+drop CustomerTelephoneDay CustomerTelephoneEvening CustomerTelephoneMobile;
+run;
+
+/*Refining the telephone data even further*/
+data	D3;
+set		D2;
+if		length(TelephoneDay)=11 and substr(TelephoneDay,1,1)='0'			then	Tel_Dayf=TelephoneDay;
+else if	length(TelephoneDay)=10 and substr(TelephoneDay,1,1) ne '0'			then	Tel_Dayf='0'||TelephoneDay;
+else if	length(TelephoneDay)=12 and substr(TelephoneDay,1,2)='00'			then	Tel_Dayf=substr(TelephoneDay,2,11);
+else																				Tel_Dayf=''; format Tel_Dayf $11.;
+if		length(TelephoneEvening)=11 and substr(TelephoneEvening,1,1)='0'	then	Tel_Evef=TelephoneEvening;
+else if	length(TelephoneEvening)=10 and substr(TelephoneEvening,1,1) ne '0'	then	Tel_Evef='0'||TelephoneEvening;
+else if	length(TelephoneEvening)=12 and substr(TelephoneEvening,1,2)='00'	then	Tel_Evef=substr(TelephoneEvening,2,11);
+else																				Tel_Evef=''; format Tel_Evef $11.;
+if		length(TelephoneMobile)=11 and substr(TelephoneMobile,1,1)='0'		then	Tel_Mobf=TelephoneMobile;
+else if	length(TelephoneMobile)=10 and substr(TelephoneMobile,1,1) ne '0'	then	Tel_Mobf='0'||TelephoneMobile;
+else if	length(TelephoneMobile)=12 and substr(TelephoneMobile,1,2)='00'		then	Tel_Mobf=substr(TelephoneMobile,2,11);
+else																				Tel_Mobf=''; format Tel_Mobf $11.;
+run;
+
+/*Adding new Dialler Requirements*/
+data	D31;
+set		D3;
+Tel_Day='             ';
+Tel_Eve='             ';
+Tel_Mob='             ';
+if	Tel_Dayf='' then Tel_Day=''; else	Tel_Day='+44'||substr(Tel_Dayf,2,10); 
+if	Tel_Evef='' then Tel_Eve=''; else	Tel_Eve='+44'||substr(Tel_Evef,2,10);
+if	Tel_Mobf='' then Tel_Mob=''; else	Tel_Mob='+44'||substr(Tel_Mobf,2,10);
+run;
+
+/*Applying Dialler requirementes for telephone priority*/
+data	D4;
+set		D31;
+TelDay='             '; if	Tel_Day='' then TelDay=''; else TelDay=Tel_Day;
+TelEve='             '; if	Tel_Eve='' then TelEve=''; else if Tel_Eve=Tel_Day then TelEve=''; else TelEve=Tel_Eve; 
+TelMob='             '; if	Tel_Mob='' then TelMob=''; else if Tel_Mob=Tel_Eve then TelMob=''; else if Tel_Mob=Tel_Day then TelMob=''; else TelMob=Tel_Mob;
+/*Contactable= Existing and valid telephone number*/
+if	TelDay ne '' or TelEve ne '' or TelMob ne '' then Contactable=1; else Contactable=0; format Contactable 1.;
+if	TelDay='' then Tel1=0; else Tel1=1; 
+if	TelEve='' then Tel2=0; else Tel2=1; 
+if	TelMob='' then Tel3=0; else Tel3=1; 
+if	Contactable=0 then NoTel=0; else NoTel=sum(of Tel1-Tel3); format NoTel 1.;
+
+drop TelephoneDay TelephoneEvening TelephoneMobile Tel_Dayf Tel_Evef Tel_Mobf Tel_Day Tel_Eve Tel_Mob Tel1 Tel2 Tel3;
+
+run;
+
+
+/*Step 8.3: Splitting populations between Resi and BTL, deduping resi accounts and selecting best contact*/
+data D_Resi; set D4; if LendingType='Resi';	run;
+proc sort data=D_Resi; by AccountNumber; run;
+
+data D_BTL;	set D4; if LendingType='BTL'; run;
+proc sort data=D_BTL; by AccountNumber; run;
+
+proc delete data= D1 D2 D3 D31 D4; run;
+
+
+/*Step 8.4: Keeping only customer data for target accounts*/
+/*Residential cases*/
+/*Selecting best contact per resi account*/
+proc sort data=D_Resi; by AccountNumber descending NoTel descending PrimcustFlag CustomerNumber; run;
+
+data	D_Resi;
+set		D_Resi;
+Rank_C+1;
+by	AccountNumber;
+if	first.AccountNumber then Rank_C=1; format Rank_C 2.;
+if	Rank_C=1;
+run;
+
+/*Merging resi target accounts with customer details*/
+data	T_Resi;
+set		RG1 RG2 RG3;
+run;
+proc sort data=T_Resi; by AccountNumber; run;
+
+data	Resi;
+merge	T_Resi(in=a) D_Resi(in=b);
+by		AccountNumber;
+if		a;
+run; 
+
+/*Removing duplication if one customer happens to have more than 1 residential account*/
+proc sort data=Resi; by CustomerNumber descending ArrBalSS Group descending BalSS descending AccountNumber; run;
+
+data	Resi_DD;
+set		Resi;
+Rank_A+1;
+by	CustomerNumber;
+if	first.CustomerNumber then Rank_A=1; format Rank_A 2.;
+run;
+
+/*Creating one instance per customer, keeping account with highes balance and appending additional targeted accounts for the same customer as columns*/
+data A1; 									set Resi_DD; where Rank_A=1; run;
+data A2(keep=AccountNumber CustomerNumber);	set Resi_DD; where Rank_A=2; run; 
+data A3(keep=AccountNumber CustomerNumber);	set Resi_DD; where Rank_A=3; run; 
+data A4(keep=AccountNumber CustomerNumber);	set Resi_DD; where Rank_A=4; run;
+data A5(keep=AccountNumber CustomerNumber);	set Resi_DD; where Rank_A=5; run; 
+data A6(keep=AccountNumber CustomerNumber);	set Resi_DD; where Rank_A=6; run;
+
+proc sql;
+CREATE TABLE ResiFinal AS
+SELECT	a1.*, a2.AccountNumber AS Acc2 label 'Acc2', a3.AccountNumber AS Acc3 label 'Acc3', a4.AccountNumber AS Acc4 label 'Acc4', a5.AccountNumber AS Acc5 label 'Acc5'
+		, a6.AccountNumber AS Acc6 label 'Acc6'   
+FROM	A1 a1
+LEFT JOIN	A2 a2 ON a1.CustomerNumber=a2.CustomerNumber
+LEFT JOIN	A3 a3 ON a1.CustomerNumber=a3.CustomerNumber
+LEFT JOIN	A4 a4 ON a1.CustomerNumber=a4.CustomerNumber
+LEFT JOIN	A5 a5 ON a1.CustomerNumber=a5.CustomerNumber
+LEFT JOIN	A6 a6 ON a1.CustomerNumber=a6.CustomerNumber
+;
+quit;
+
+proc delete data= Qual_Resi&ss D_Resi RG1 RG2 RG3 T_Resi Resi Resi_DD A1 A2 A3 A4 A5 A6; run;
+
+data RG1; set ResiFinal; if Group='G1' and Contactable=1; run; proc sort data=RG1; by AccountNumber; run;
+data RG2; set ResiFinal; if Group='G2' and Contactable=1; run; proc sort data=RG2; by AccountNumber; run;
+data RG3; set ResiFinal; if Group='G3' and Contactable=1; run; proc sort data=RG3; by AccountNumber; run;
+data RNC; set ResiFinal; if Contactable=0; run; proc sort data=RNC; by AccountNumber; run;
+
+
+/*BTL cases*/
+/*Merging BTL target accounts with customer details*/
+data	T_BTL;
+set		BG1 BG2 BG3;
+run;
+proc sort data=T_BTL; by CustomerNumber AccountNumber; run; 
+proc sort data=D_BTL; by CustomerNumber AccountNumber; run;
+
+data	BTL;
+merge	T_BTL(in=a) D_BTL(in=b);
+by		CustomerNumber AccountNumber;
+if		a;
+run; 
+
+/*Removing duplication if one customer happens to have more than 1 BTL account*/
+proc sort data=BTL; by CustomerNumber descending ArrBalSS Group descending BalSS descending AccountNumber; run;
+
+data	BTL_DD;
+set		BTL;
+Rank_A+1;
+by	CustomerNumber;
+if	first.CustomerNumber then Rank_A=1; format Rank_A 2.;
+run;
+
+/*Creating one instance per customer, keeping account with lowest score and current arrears first and appending additional targeted accounts for the same customer as columns*/
+data A1; set BTL_DD; where Rank_A=1; run; 
+data A2; set BTL_DD; where Rank_A=2; keep AccountNumber CustomerNumber ArrBalSS Group; run;
+data A3; set BTL_DD; where Rank_A=3; keep AccountNumber CustomerNumber ArrBalSS Group; run;
+data A4; set BTL_DD; where Rank_A=4; keep AccountNumber CustomerNumber ArrBalSS Group; run;
+data A5; set BTL_DD; where Rank_A=5; keep AccountNumber CustomerNumber ArrBalSS Group; run;
+data A6; set BTL_DD; where Rank_A=6; keep AccountNumber CustomerNumber ArrBalSS Group; run;
+
+proc sql;
+CREATE TABLE BTLFinal AS
+SELECT	a1.*
+		, a2.AccountNumber AS Acc2 label 'Acc2', a2.ArrBalSS AS Acc2_Arr label 'Acc2_Arr', a2.Group AS Acc2_G label 'Acc2_G'
+		, a3.AccountNumber AS Acc3 label 'Acc3', a3.ArrBalSS AS Acc3_Arr label 'Acc3_Arr', a3.Group AS Acc3_G label 'Acc3_G'
+		, a4.AccountNumber AS Acc4 label 'Acc4', a4.ArrBalSS AS Acc4_Arr label 'Acc4_Arr', a4.Group AS Acc4_G label 'Acc4_G'
+		, a5.AccountNumber AS Acc5 label 'Acc5', a5.ArrBalSS AS Acc5_Arr label 'Acc5_Arr', a5.Group AS Acc5_G label 'Acc5_G'
+		, a6.AccountNumber AS Acc6 label 'Acc6', a6.ArrBalSS AS Acc6_Arr label 'Acc6_Arr', a6.Group AS Acc6_G label 'Acc6_G'
+FROM	A1 a1
+LEFT JOIN	A2 a2 ON a1.CustomerNumber=a2.CustomerNumber
+LEFT JOIN	A3 a3 ON a1.CustomerNumber=a3.CustomerNumber
+LEFT JOIN	A4 a4 ON a1.CustomerNumber=a4.CustomerNumber
+LEFT JOIN	A5 a5 ON a1.CustomerNumber=a5.CustomerNumber
+LEFT JOIN	A6 a6 ON a1.CustomerNumber=a6.CustomerNumber
+;
+quit;
+proc sort data=BTLFinal; by Group; run;
+
+proc delete data= Qual_B&ss BG1 BG2 BG3 T_BTL D_BTL BTL BTL_DD A1 A2 A3 A4 A5 A6; run;
+
+data BG1; set BTLFinal; where Group='G1' and Contactable=1; run; proc sort data=BG1; by AccountNumber; run;
+data BG2; set BTLFinal; where Group='G2' and Contactable=1; run; proc sort data=BG2; by AccountNumber; run;
+data BG3; set BTLFinal; where Group='G3' and Contactable=1; run; proc sort data=BG3; by AccountNumber; run;
+data BNC; set BTLFinal; if Contactable=0; run; proc sort data=BNC; by AccountNumber; run;
+
+
+
+/*Step 9: Updating History Tables*/
+data out.Resi_Hist; set out.Resi_Hist R_Target; run;	
+proc sort data=out.Resi_Hist; by AccountNumber descending SSContact; run;
+
+data out.BTL_Hist; set out.BTL_Hist B_Target; run; 
+proc sort data=out.BTL_Hist; by AccountNumber descending SSContact; run; 
+
+
+data out.Resi&ss; set RG1 RG2 RG3; run; 
+proc sort data=out.Resi&ss; by AccountNumber; run;
+
+data out.BTL&ss; set BG1 BG2 BG3; run;
+proc sort data=out.BTL&ss; by AccountNumber; run;
+
+
+
+
+/*Step 10: Data export*/
+/*Resi output*/
+proc export data=RG1
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs CM\Resi&ss..xlsx"
+dbms=xlsx replace;
+sheet="RG1";
+proc export data=RG2
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs CM\Resi&ss..xlsx"
+dbms=xlsx replace;
+sheet="RG2";
+proc export data=RG3
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs CM\Resi&ss..xlsx"
+dbms=xlsx replace;
+sheet="RG3";
+proc export data=RNC
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs CM\Resi&ss..xlsx"
+dbms=xlsx replace;
+sheet="RNC";
+run;
+
+/*BTL output*/
+proc export data=BG1
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs CM\BTL&ss..xlsx"
+dbms=xlsx replace;
+sheet="BG1";
+proc export data=BG2
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs CM\BTL&ss..xlsx"
+dbms=xlsx replace;
+sheet="BG2";
+proc export data=BG3
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs CM\BTL&ss..xlsx"
+dbms=xlsx replace;
+sheet="BG3";
+proc export data=BNC
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs CM\BTL&ss..xlsx"
+dbms=xlsx replace;
+sheet="BNC";
+run;
+
+
+/*Dialler outputs*/
+data	R_Dialler;
+set		ResiFinal;
+Groups=Group;
+EXCLUDERECORD='';
+TimeZone='Europe/London';
+where	Contactable=1;
+keep	IACCNBRO Custnbro Mretcu Firnameu Surnameu TelDay TelEve TelMob Groups EXCLUDERECORD TimeZone; 	
+run;
+proc sort data=R_Dialler; by Groups IACCNBRO; run;
+proc export data=R_Dialler
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs Dialler\PreArrears&ss.Resi.xlsx"
+dbms=xlsx replace;
+sheet="PreArrears&ss.Resi";
+run;
+
+
+data	B_Dialler;
+set		BTLFinal;
+Groups=Group;
+EXCLUDERECORD='';
+TimeZone='Europe/London';
+where	Contactable=1;
+keep	IACCNBRO Custnbro Mretcu Firnameu Surnameu TelDay TelEve TelMob Groups EXCLUDERECORD TimeZone; 	
+run;
+proc sort data=B_Dialler; by Groups IACCNBRO; run;
+proc export data=B_Dialler
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Outputs Dialler\PreArrears&ss.BTL.xlsx"
+dbms=xlsx replace;
+sheet="PreArrears&ss.BTL";
+run;
+
+
+/*Mailing output (requires further manipulation in Excel and SQL)*/
+data	mailing_resi(keep=AccountNumber);
+set		Resifinal;
+run;
+data	mailing_btl(keep=AccountNumber);
+set		BTLfinal;
+run;
+proc export data=mailing_resi
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Mailing\MailingAccounts.xlsx"
+dbms=xlsx replace;
+sheet="Resi";
+run;
+proc export data=mailing_btl
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Mailing\MailingAccounts.xlsx"
+dbms=xlsx replace;
+sheet="BTL";
+run;
+
+
+/*Pre-Arrears Monitoring output (requires further manipulation in Excel, SQL and PBI)*/
+%let cm=%sysfunc(intnx(month,&rundate,1),yymmn6.); /*Contact month (current month)*/
+%let cd=%sysfunc(intnx(month,&rundate,1)); /*Contact date (1st day current month)*/
+
+data	monitoring_resi;
+set		Resifinal (keep=AccountNumber Lending Group);
+ContactPeriod=&cm;
+ContactDate=&cd;format ContactDate yymmdd10.;
+Strategy="Pre Arrears";
+PrimaryAccount=AccountNumber;
+Segment=Lending;
+RiskGroup=Group;
+keep ContactPeriod ContactDate Strategy PrimaryAccount Segment RiskGroup;
+run;
+proc sort data=monitoring_resi; by RiskGroup PrimaryAccount; run;
+
+data	monitoring_btl;
+set		BTLfinal (keep=AccountNumber Lending Group);
+ContactPeriod=&cm;
+ContactDate=&cd;format ContactDate yymmdd10.;
+Strategy="Pre Arrears";
+PrimaryAccount=AccountNumber;
+Segment=Lending;
+RiskGroup=Group;
+keep ContactPeriod ContactDate Strategy PrimaryAccount Segment RiskGroup;
+run;
+proc sort data=monitoring_btl; by RiskGroup PrimaryAccount; run;
+
+data	monitoring;
+set		monitoring_resi monitoring_btl;
+run;
+
+proc export data=monitoring
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2019\Pre Arrears\2019 Strategy - Deployment\Monthly monitoring\Monitoring.xlsx"
+dbms=xlsx replace;
+sheet="&cm";
+run;
+
+
+/*Residual Arrears exclusions (requires further manipulation in Excel and SQL)*/
+data	rae;
+set		DDR&ss(keep=AccountNumber) Resifinal(keep=AccountNumber) BTLfinal(keep=AccountNumber);
+run;
+
+proc export data=rae
+outfile="H:\Portfolio Management\Credit Management\Collections Strategies 2023\Residual Arrears\DDR_PA_Exclusions.xlsx"
+dbms=xlsx replace;
+run;
